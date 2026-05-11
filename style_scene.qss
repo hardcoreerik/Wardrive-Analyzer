@@ -1,0 +1,199 @@
+/* style_scene.qss — WARDIVE "scene" skin */
+
+QWidget {
+    color: #cafff0;
+    font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+    font-size: 11pt;
+}
+
+QFrame#HudFrame {
+    background: rgba(0, 0, 0, 90);
+    border: 1px solid rgba(0, 255, 208, 140);
+    border-radius: 10px;
+}
+
+QLabel#HudTitle {
+    color: #00ffd0;
+    font-size: 18pt;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+QLabel#HudProject, QLabel#HudStatus {
+    color: rgba(202, 255, 240, 220);
+    font-size: 10pt;
+}
+
+QFrame#Panel {
+    background: rgba(0, 0, 0, 70);
+    border: 1px solid rgba(0, 255, 208, 90);
+    border-radius: 12px;
+}
+
+QLabel#PanelTitle {
+    color: #00ffd0;
+    font-weight: 600;
+}
+
+QLabel#PathLabel {
+    color: rgba(202, 255, 240, 220);
+    padding: 4px 0px;
+}
+
+QPushButton {
+    background: rgba(8, 10, 12, 180);
+    border: 1px solid rgba(0, 255, 208, 140);
+    border-radius: 10px;
+    padding: 8px 10px;
+}
+
+QPushButton:hover {
+    background: rgba(0, 255, 208, 170);
+    color: #000000;
+}
+
+QPushButton:pressed {
+    background: rgba(0, 210, 180, 190);
+    padding-top: 9px;
+    padding-left: 11px;
+}
+
+QPushButton#PrimaryButton {
+    background: rgba(0, 255, 208, 170);
+    color: #000000;
+    font-weight: 700;
+}
+
+QListWidget {
+    background: rgba(0, 0, 0, 100);
+    border: 1px solid rgba(0, 255, 208, 80);
+    border-radius: 10px;
+    padding: 6px;
+}
+
+QListWidget::item {
+    padding: 6px;
+}
+
+QListWidget::item:selected {
+    background: rgba(0, 255, 208, 120);
+    color: #000000;
+}
+
+QTextEdit#Console {
+    background: rgba(0, 0, 0, 175);
+    border: 1px solid rgba(0, 255, 208, 80);
+    border-radius: 10px;
+    padding: 10px;
+}
+
+QFrame#Footer {
+    background: rgba(0, 0, 0, 110);
+    border: 1px solid rgba(0, 255, 208, 70);
+    border-radius: 10px;
+}
+
+QProgressBar#Progress {
+    background: rgba(0, 0, 0, 90);
+    border: 1px solid rgba(0, 255, 208, 100);
+    border-radius: 8px;
+    text-align: center;
+    height: 18px;
+}
+
+QProgressBar::chunk {
+    background: rgba(0, 255, 208, 160);
+    border-radius: 8px;
+}
+
+QLabel#TimerLabel {
+    color: rgba(202, 255, 240, 220);
+}
+
+QLabel#StatChip {
+    background: rgba(0, 0, 0, 110);
+    border: 1px solid rgba(0, 255, 208, 80);
+    border-radius: 8px;
+    padding: 8px 10px;
+    color: rgba(220, 255, 248, 235);
+    font-weight: 600;
+}
+
+QLabel#Notes {
+    color: rgba(202, 255, 240, 205);
+}
+
+QTableWidget {
+    background: rgba(0, 0, 0, 105);
+    alternate-background-color: rgba(0, 45, 42, 75);
+    border: 1px solid rgba(0, 255, 208, 70);
+    border-radius: 10px;
+    gridline-color: rgba(0, 255, 208, 45);
+    selection-background-color: rgba(0, 255, 208, 135);
+    selection-color: #000000;
+}
+
+QHeaderView::section {
+    background: rgba(0, 255, 208, 135);
+    color: #000000;
+    border: 0px;
+    padding: 6px;
+    font-weight: 700;
+}
+
+/* Tabs */
+QTabWidget::pane {
+    border: 1px solid rgba(0, 255, 208, 70);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 55);
+}
+
+QTabBar::tab {
+    background: rgba(0, 0, 0, 120);
+    border: 1px solid rgba(0, 255, 208, 60);
+    padding: 8px 14px;
+    margin-right: 6px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+}
+
+QTabBar::tab:selected {
+    background: rgba(0, 255, 208, 140);
+    color: #000000;
+    font-weight: 700;
+}
+
+/* Console dock (always visible) */
+QFrame#ConsoleDockFrame {
+    background: rgba(0, 0, 0, 55);
+    border: 1px solid rgba(0, 255, 208, 60);
+    border-radius: 12px;
+    padding: 8px;
+}
+
+QLabel#ConsoleDockHeader {
+    color: rgba(202, 255, 240, 220);
+    font-size: 10pt;
+}
+
+QPlainTextEdit#ConsoleDock {
+    background: rgba(0, 0, 0, 90);
+    border: 1px solid rgba(0, 255, 208, 60);
+    border-radius: 10px;
+    padding: 10px;
+    font-size: 10pt;
+}
+
+QPlainTextEdit#ConsoleBig {
+    background: rgba(0, 0, 0, 165);
+    border: 1px solid rgba(0, 255, 208, 70);
+    border-radius: 10px;
+    padding: 12px;
+}
+
+/* Right demoscene panel */
+QWidget#DemoscenePanel {
+    background: rgba(0, 0, 0, 20);
+    border: 1px solid rgba(0, 255, 208, 55);
+    border-radius: 14px;
+}

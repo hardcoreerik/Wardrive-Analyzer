@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+dist_nuitka/
+build/
+*.spec.bak
+
+# PyInstaller / Nuitka build output
+dist/
+build/
+dist_nuitka/
+*.onefile-build/
+
+# Project data (never commit wardrive evidence)
+Projects/
+*.db
+*.db-shm
+*.db-wal
+wardrive_run.log
+
+# Evidence and exports (may contain sensitive location data)
+Projects/*/evidence/
+Projects/*/exports/
+Projects/*/runs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+*.env
+*.key
+*.token
