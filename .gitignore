@@ -43,3 +43,4 @@ desktop.ini
 *.env
 *.key
 *.token
+.claude/settings.local.json
