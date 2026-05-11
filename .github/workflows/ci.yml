@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+      - "codex/**"
+      - "claude/**"
+
+jobs:
+  syntax-check:
+    name: Syntax check
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile tracked Python files
+        shell: pwsh
+        run: |
+          $files = git ls-files "*.py"
+          if (-not $files) {
+            Write-Host "No Python files found."
+            exit 0
+          }
+          python -m py_compile @files

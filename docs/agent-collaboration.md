@@ -183,6 +183,17 @@ Pull requests should include:
 - handoff notes,
 - risk or follow-up items.
 
+## Auto-Merge
+
+The repository is configured for pull-request based collaboration with auto-merge available.
+
+- Keep task branches short-lived.
+- Keep pull requests small enough for review.
+- Wait for the `CI / Syntax check` workflow before merging.
+- Prefer squash merge unless the user asks to preserve individual commits.
+- Delete merged branches after integration.
+- Do not enable auto-merge on another agent's pull request unless the handoff notes and verification are clear.
+
 ## Conflict Avoidance
 
 - Do not force-push another agent's branch.
