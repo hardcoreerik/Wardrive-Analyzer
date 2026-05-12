@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import hashlib
 import sqlite3
@@ -28,7 +29,9 @@ class CandidateFile:
     size: int
 
 
-# --- patterns / allow-lists (Option 1) ---
+# --- patterns / allow-lists ---
+
+# Marauder numbered PCAP outputs  (e.g. beacon_0.pcap, raw_1.pcap)
 _MARAUDER_PCAP_PREFIXES = (
     "raw_",
     "beacon_",
@@ -40,11 +43,16 @@ _MARAUDER_PCAP_PREFIXES = (
     "multissid_",
     "deauth_",
     "sae_commit_",
+    "flock_",       # Flock module captures
+    "yoink_",       # Yoink module captures
+    "jammit_",      # Jammit module root-level pcaps
 )
 
+# Marauder .log / .txt outputs (WiGLE CSV format or scan logs)
 _MARAUDER_LOG_PREFIXES = (
     "wardrive_",
     "station_wardrive_",
+    "flock_wardrive_",
     "pingscan_",
     "arpscan_",
     "portscan_",
@@ -53,7 +61,39 @@ _MARAUDER_LOG_PREFIXES = (
     "dns_",
     "http_",
     "https_",
+    "yoink_",       # Yoink session logs (metadata, not WiGLE CSV)
+    "jammit_",      # Jammit session logs (metadata)
+    "recon_",       # Recon scan outputs
+    "flock_",       # Flock session logs
 )
+
+# Marauder scan outputs in CSV format (not WiGLE, not log extension)
+_MARAUDER_CSV_PREFIXES = (
+    "portscan_",
+    "arpscan_",
+    "pingscan_",
+    "recon_",
+    "sshscan_",
+    "telnetscan_",
+    "stats",        # Jammit per-second stats.csv
+)
+
+# Jammit per-target capture session: known bare filenames produced inside SSID_BSSID/ dirs
+_JAMMIT_PCAP_NAMES = {"beacon.pcap", "handshakes.pcap", "raw.pcap", "jammit_deauths.pcap"}
+_JAMMIT_META_NAMES = {"capture_summary.txt", "jammit_session.log", "stats.csv"}
+
+# Regex: a directory named  <something>_XX-XX-XX-XX-XX-XX  (Jammit per-target folder)
+_JAMMIT_TARGET_DIR_RE = re.compile(
+    r"(?:^|/)captures/[^/]+_[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}(?:/|$)",
+    re.IGNORECASE,
+)
+
+# Kinds that are NOT wardrive/GPS data — exclude from log analysis input
+_NON_WARDRIVE_LOG_KINDS = {
+    "jammit_session", "yoink_session", "jammit_summary",
+    "jammit_stats",   "jammit_other",  "recon_csv",
+    "log_yoink",      "log_jammit",    "log_flock",
+}
 
 _BRUCE_FILES_RECOMMENDED = {"bruce_creds.csv"}
 _BRUCE_FILES_OPTIONAL = {"bruce.conf", "shortcuts.json", "boot.jpg", "boot.gif", "boot.wav"}
@@ -351,15 +391,38 @@ def compare_run_masters(new_csv: str, old_csv: str) -> Dict[str, object]:
     }
 
 
-def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+def sha256_file(path: str, chunk_size: int = 1024 * 1024, progress_cb=None) -> str:
+    """SHA-256 a file in chunks. progress_cb(bytes_done, bytes_total) called each chunk."""
     h = hashlib.sha256()
+    total = os.path.getsize(path)
+    done = 0
     with open(path, "rb") as f:
         while True:
             b = f.read(chunk_size)
             if not b:
                 break
             h.update(b)
+            done += len(b)
+            if progress_cb:
+                progress_cb(done, total)
     return h.hexdigest()
+
+
+def _copy_with_progress(src: str, dst: str, progress_cb=None,
+                        chunk_size: int = 512 * 1024) -> None:
+    """Copy src → dst in chunks, calling progress_cb(bytes_done, bytes_total) each chunk."""
+    total = os.path.getsize(src)
+    done = 0
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            buf = fsrc.read(chunk_size)
+            if not buf:
+                break
+            fdst.write(buf)
+            done += len(buf)
+            if progress_cb:
+                progress_cb(done, total)
+    shutil.copystat(src, dst)
 
 
 def looks_like_project_dir(dir_path: str) -> bool:
@@ -383,21 +446,31 @@ def should_skip_dir(dir_path: str) -> bool:
     return False
 
 
+def _in_jammit_capture_dir(rel_lower: str) -> bool:
+    """True if this path is inside a Jammit per-target capture directory."""
+    # Matches  captures/<any>  whether the dir uses dashes or not
+    return "/captures/" in rel_lower or rel_lower.startswith("captures/")
+
+
 def classify_candidate(rel_path: str, filename: str) -> Tuple[SourceApp, str, bool, str]:
     """Return (source_app, kind, recommended, reason)."""
     fn = filename.lower()
     rel_lower = rel_path.lower().replace("\\", "/")
     ext = os.path.splitext(fn)[1].lower()
 
+    # ----------------------------------------------------------------
     # Nemo (M5Stick Nemo)
-    if 'nemo' in rel_lower or fn.startswith('nemo'):
-        if ext in ('.pcap', '.pcapng'):
-            return 'nemo', 'pcap_capture', True, 'Nemo capture/pcap'
-        if ext in ('.txt', '.log', '.csv', '.json', '.html'):
-            rec = fn.endswith('creds.txt') or 'creds' in fn or 'loot' in rel_lower
-            return 'nemo', 'nemo_output', True if rec else False, 'Nemo output/results'
+    # ----------------------------------------------------------------
+    if "nemo" in rel_lower or fn.startswith("nemo"):
+        if ext in (".pcap", ".pcapng"):
+            return "nemo", "pcap_capture", True, "Nemo capture"
+        if ext in (".txt", ".log", ".csv", ".json", ".html"):
+            rec = "creds" in fn or "loot" in rel_lower
+            return "nemo", "nemo_output", rec, "Nemo output/results"
 
+    # ----------------------------------------------------------------
     # Bruce
+    # ----------------------------------------------------------------
     if fn in _BRUCE_FILES_RECOMMENDED:
         return "bruce", "bruce_creds", True, "Bruce creds/results"
     if fn in _BRUCE_FILES_OPTIONAL:
@@ -405,29 +478,86 @@ def classify_candidate(rel_path: str, filename: str) -> Tuple[SourceApp, str, bo
     if "/scripts/" in rel_lower:
         return "bruce", "bruce_script", False, "Bruce scripts"
 
-    # Porkchop
+    # ----------------------------------------------------------------
+    # Hashcat .22000 (from any tool — Jammit, Porkchop, manual)
+    # ----------------------------------------------------------------
     if ext == ".22000":
-        return "porkchop", "handshake_22000", True, "Hashcat 22000 capture"
+        return "marauder", "handshake_22000", True, "Hashcat 22000 handshake"
+
+    # ----------------------------------------------------------------
+    # Porkchop loot directory
+    # ----------------------------------------------------------------
     if "porkchop" in rel_lower or "/loot/" in rel_lower or rel_lower.endswith("/loot"):
         if ext in (".pcap", ".pcapng"):
-            return "porkchop", "pcap_capture", True, "Capture in Porkchop loot"
+            return "porkchop", "pcap_capture", True, "Porkchop loot capture"
         if ext in (".txt", ".log", ".csv", ".json"):
             return "porkchop", "loot_meta", False, "Porkchop loot metadata"
 
-    # Marauder
+    # ----------------------------------------------------------------
+    # Jammit per-target capture directories: captures/<SSID_BSSID>/
+    # These contain bare-named files (beacon.pcap, handshakes.pcap, etc.)
+    # ----------------------------------------------------------------
+    if _in_jammit_capture_dir(rel_lower):
+        if ext in (".pcap", ".pcapng"):
+            if fn in _JAMMIT_PCAP_NAMES:
+                kind_tag = os.path.splitext(fn)[0]  # beacon, handshakes, raw, jammit_deauths
+                return "marauder", f"pcap_{kind_tag}", True, f"Jammit {fn}"
+            # Named handshake pcaps inside Handshakes/ subdir: SSID_BSSID_N.pcap
+            if "/handshakes/" in rel_lower:
+                return "marauder", "pcap_handshakes", True, "Jammit named handshake PCAP"
+            return "marauder", "pcap_jammit", True, "Jammit capture"
+        if fn == "capture_summary.txt":
+            return "marauder", "jammit_summary", True, "Jammit capture summary"
+        if fn == "stats.csv":
+            return "marauder", "jammit_stats", True, "Jammit per-second stats"
+        if fn in ("jammit_session.log",):
+            return "marauder", "jammit_session", False, "Jammit session log (metadata)"
+        if ext in (".log", ".txt"):
+            return "marauder", "jammit_other", False, "Jammit session file"
+        if ext == ".csv":
+            for p in _MARAUDER_CSV_PREFIXES:
+                if fn.startswith(p):
+                    return "marauder", "log_" + p.rstrip("_"), True, "Marauder scan CSV"
+            return "marauder", "jammit_other", False, "Jammit CSV file"
+        return "marauder", "jammit_other", False, "Jammit session file"
+
+    # ----------------------------------------------------------------
+    # Marauder — PCAP files
+    # ----------------------------------------------------------------
     if ext in (".pcap", ".pcapng"):
         for p in _MARAUDER_PCAP_PREFIXES:
             if fn.startswith(p):
                 return "marauder", "pcap_" + p.rstrip("_"), True, "Marauder capture"
         return "unknown", "pcap", False, "PCAP (unrecognized naming)"
+
+    # ----------------------------------------------------------------
+    # Marauder — CSV scan outputs (portscan_*.csv, recon_scan.csv, etc.)
+    # ----------------------------------------------------------------
+    if ext == ".csv":
+        for p in _MARAUDER_CSV_PREFIXES:
+            if fn.startswith(p):
+                return "marauder", "recon_csv", True, "Marauder scan result (CSV)"
+        return "unknown", "other", False, "CSV (unrecognized)"
+
+    # ----------------------------------------------------------------
+    # Marauder — log / text outputs
+    # ----------------------------------------------------------------
     if ext in (".log", ".txt"):
         for p in _MARAUDER_LOG_PREFIXES:
             if fn.startswith(p):
-                return "marauder", "log_" + p.rstrip("_"), True, "Marauder output log"
+                kind = "log_" + p.rstrip("_").rstrip("_wardrive").rstrip("_")
+                # Preserve full prefix for wardrive variants so analysis picks them up
+                kind = "log_" + p.rstrip("_")
+                return "marauder", kind, True, "Marauder output log"
         return "unknown", "log", False, "Log/text (unrecognized naming)"
 
+    # ----------------------------------------------------------------
+    # Firmware / other
+    # ----------------------------------------------------------------
     if ext in (".bin", ".uf2"):
         return "unknown", "firmware", False, "Firmware/update"
+    if ext == ".json":
+        return "unknown", "other", False, "JSON config/data"
     return "unknown", "other", False, "Not recognized"
 
 
@@ -440,8 +570,19 @@ def scan_sd_folder(sd_root: str, include_hidden: bool = False) -> List[Candidate
     results: List[CandidateFile] = []
     sd_root = os.path.abspath(sd_root)
 
-    for dirpath, dirnames, filenames in os.walk(sd_root):
-        dirnames[:] = [d for d in dirnames if not should_skip_dir(os.path.join(dirpath, d))]
+    for dirpath, dirnames, filenames in os.walk(sd_root, onerror=lambda _: None):
+        # Filter directories in-place: skip project output dirs and protected system folders
+        filtered = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            # Skip Windows system folders that cause permission hangs
+            if d in ("System Volume Information", "$RECYCLE.BIN", "$SysReset",
+                     "System Recovery", "Recovery", "RECYCLER"):
+                continue
+            if should_skip_dir(full):
+                continue
+            filtered.append(d)
+        dirnames[:] = filtered
 
         for fn in filenames:
             if not include_hidden and fn.startswith("."):
@@ -476,6 +617,9 @@ def scan_sd_folder(sd_root: str, include_hidden: bool = False) -> List[Candidate
     return results
 
 
+_FILE_PROGRESS_MIN_BYTES = 1 * 1024 * 1024  # only emit byte progress for files >= 1 MB
+
+
 def ingest_candidates_to_project(
     project_dir: str,
     sd_root: str,
@@ -483,8 +627,15 @@ def ingest_candidates_to_project(
     label: str = "",
     skip_duplicates: bool = True,
     progress_cb=None,
+    file_progress_cb=None,
 ) -> Dict[str, int]:
-    """Copy-ingest candidates into the project vault (Option A). Dedupe is SHA-256 content-based."""
+    """
+    Copy-ingest candidates into the project vault. Dedupe is SHA-256 content-based.
+
+    file_progress_cb(filename, phase, bytes_done, bytes_total)
+        phase: "hash" | "copy"
+        Called each chunk for files >= _FILE_PROGRESS_MIN_BYTES.
+    """
     db_path = ensure_project_vault(project_dir)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -510,8 +661,15 @@ def ingest_candidates_to_project(
         for idx, cand in enumerate(candidates, start=1):
             if progress_cb:
                 progress_cb(f"Ingest {idx}/{len(candidates)}: hashing {cand.filename} ...")
+
+            large = cand.size >= _FILE_PROGRESS_MIN_BYTES
+
+            def _hash_cb(done, total, _fn=cand.filename):
+                if file_progress_cb:
+                    file_progress_cb(_fn, "hash", done, total)
+
             try:
-                h = sha256_file(cand.abs_path)
+                h = sha256_file(cand.abs_path, progress_cb=(_hash_cb if large else None))
             except Exception as e:
                 stats["errors"] += 1
                 if progress_cb:
@@ -527,8 +685,14 @@ def ingest_candidates_to_project(
             else:
                 dest_path = os.path.join(dest_root, cand.rel_path)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+                def _copy_cb(done, total, _fn=cand.filename):
+                    if file_progress_cb:
+                        file_progress_cb(_fn, "copy", done, total)
+
                 try:
-                    shutil.copy2(cand.abs_path, dest_path)
+                    _copy_with_progress(cand.abs_path, dest_path,
+                                        progress_cb=(_copy_cb if large else None))
                 except Exception as e:
                     stats["errors"] += 1
                     if progress_cb:
@@ -593,21 +757,27 @@ def list_project_evidence(project_dir: str) -> List[Dict[str, str]]:
 
 
 def gather_project_inputs_for_analysis(project_dir: str) -> Tuple[List[str], List[str]]:
-    """Build (logs, pcaps) lists from all evidence in project vault."""
+    """Build (wardrive_logs, pcaps) from project vault evidence.
+
+    Only WiGLE-format wardrive logs are included as logs; session/debug/scan
+    outputs are excluded even if their kind starts with 'log_'.
+    """
     rows = list_project_evidence(project_dir)
     logs: List[str] = []
     pcaps: List[str] = []
     for r in rows:
         p = r.get("stored_path") or ""
+        if not p or not os.path.exists(p):
+            continue
         kind = (r.get("kind") or "").lower()
         ext = os.path.splitext(p)[1].lower()
-        if ext in (".pcap", ".pcapng") or kind.startswith("pcap"):
-            if os.path.exists(p):
-                pcaps.append(p)
-        elif ext in (".log", ".txt") or kind.startswith("log"):
-            if os.path.exists(p):
-                logs.append(p)
-    # stable sort and de-dupe by path
+
+        if ext in (".pcap", ".pcapng") or kind.startswith("pcap_"):
+            pcaps.append(p)
+        elif ext in (".log", ".txt") and kind not in _NON_WARDRIVE_LOG_KINDS:
+            # Only accept WiGLE-format text log extensions; .csv is never a wardrive log
+            logs.append(p)
+
     logs = sorted(dict.fromkeys(logs))
     pcaps = sorted(dict.fromkeys(pcaps))
     return logs, pcaps

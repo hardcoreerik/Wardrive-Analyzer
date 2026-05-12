@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 from PySide6.QtWidgets import QApplication
+from error_logger import install_global_error_hooks, write_error_report
 from gui_step3d_scene import WardriveGUI
 
 
@@ -30,15 +31,21 @@ def load_stylesheet():
 
 def main():
     log_path = setup_logging()
-    app = QApplication(sys.argv)
-    app.setStyleSheet(load_stylesheet())
-    window = WardriveGUI()
     try:
-        window._log(f"Log file: {log_path}" if log_path else "Log file: (failed to init)")
-    except Exception:
-        pass
-    window.show()
-    sys.exit(app.exec())
+        install_global_error_hooks(os.getcwd())
+        app = QApplication(sys.argv)
+        app.setStyleSheet(load_stylesheet())
+        window = WardriveGUI()
+        try:
+            window._log(f"Log file: {log_path}" if log_path else "Log file: (failed to init)")
+        except Exception:
+            pass
+        window.show()
+        sys.exit(app.exec())
+    except Exception as exc:
+        report = write_error_report("startup_or_event_loop_error", exc, base_dir=os.getcwd())
+        logging.exception("Fatal startup/event-loop error. Report: %s", report)
+        raise
 
 if __name__ == "__main__":
     main()

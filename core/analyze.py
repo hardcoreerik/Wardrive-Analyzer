@@ -30,7 +30,7 @@ def _emit_checklist(cb: Optional[Callable[[str], None]], run_dir: str, expected:
     _emit(cb, "=== Run Output Checklist ===")
     for rel in expected:
         p = os.path.join(run_dir, rel)
-        mark = "✅" if os.path.exists(p) else "❌"
+        mark = "[OK]" if os.path.exists(p) else "[MISSING]"
         _emit(cb, f"{mark} {rel}")
     _emit(cb, "=== End Checklist ===")
 

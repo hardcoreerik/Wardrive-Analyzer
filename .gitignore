@@ -22,6 +22,9 @@ Projects/
 *.db-shm
 *.db-wal
 wardrive_run.log
+error_reports/
+stdout_app.log
+stderr_app.log
 
 # Evidence and exports (may contain sensitive location data)
 Projects/*/evidence/

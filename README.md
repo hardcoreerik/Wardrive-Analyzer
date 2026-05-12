@@ -68,6 +68,18 @@ This repository is shared between Codex and Claude Code.
 
 Use pull requests as the visible handoff channel. Uncommitted local edits are invisible to the other agent.
 
+## AI Bridge
+
+Local agents can inspect and operate the project through JSON commands without opening a network service.
+
+```powershell
+python wardrive_cli.py project-summary "F:\WardriveAnalytics"
+python wardrive_cli.py latest-run "F:\WardriveAnalytics"
+python wardrive_cli.py analyze-project "F:\WardriveAnalytics" --events
+```
+
+See [docs/ai-bridge.md](docs/ai-bridge.md).
+
 ## Verification
 
 Useful checks:
@@ -90,6 +102,8 @@ Wardrive Analyzer/
 |-- run_step3d_scene.py       # App entrypoint
 |-- gui_step3d_scene.py       # PySide6 Mission Control UI
 |-- project_vault.py          # Project vault, SD scan, ingest, dedupe
+|-- wardrive_service.py       # Shared local service functions for GUI/CLI/agents
+|-- wardrive_cli.py           # JSON CLI and stdio bridge for local agents
 |-- core/
 |   |-- analyze.py            # Report orchestration
 |   |-- parser_logs.py        # Wardrive log parsing

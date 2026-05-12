@@ -30,6 +30,34 @@ from .helpers import (
 )
 from .parser_logs import Sighting
 
+_EXCEL_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+_PRINTABLE_CONTROL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F-\x9F]")
+_EXCEL_MAX_CELL_CHARS = 32767
+
+
+def clean_report_value(value, max_chars: int = _EXCEL_MAX_CELL_CHARS):
+    """Return a report-safe scalar for CSV/XLSX/HTML writers."""
+    if value is None:
+        return NO_DATA
+    if isinstance(value, (int, float, bool)):
+        return value
+
+    text = str(value)
+    if not text:
+        return NO_DATA
+
+    text = _PRINTABLE_CONTROL_RE.sub("", text)
+    text = _EXCEL_ILLEGAL_RE.sub("", text)
+    text = text.replace("\ufffd", "?")
+    text = text.strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 20] + "... [truncated]"
+    return text or NO_DATA
+
+
+def clean_report_row(row: dict) -> dict:
+    return {k: clean_report_value(v) for k, v in row.items()}
+
 
 # ---------------------------------------------------------------------------
 # OUI lookup
@@ -96,7 +124,7 @@ def category_guess(role: str, vendor: str, locally_admin: bool) -> str:
 
 
 def ssid_display(ssid_raw: str) -> str:
-    s = ssid_raw if ssid_raw not in (None, "", NO_DATA) else ""
+    s = clean_report_value(ssid_raw, max_chars=512) if ssid_raw not in (None, "", NO_DATA) else ""
     if not s:
         return "ASCII: <MISSING>"
     if re.fullmatch(r"[0-9A-Fa-f]+", s) and len(s) % 2 == 0 and len(s) >= 2:
@@ -119,17 +147,19 @@ def ssid_display(ssid_raw: str) -> str:
 def write_csv(rows: List[dict], outdir: str, filename: str) -> str:
     path = os.path.join(outdir, filename)
     headers = list(rows[0].keys()) if rows else ["MAC"]
+    safe_rows = [clean_report_row(r) for r in rows] if rows else []
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, headers)
         w.writeheader()
-        if rows:
-            w.writerows(rows)
+        if safe_rows:
+            w.writerows(safe_rows)
     return path
 
 
 def write_xlsx(rows: List[dict], outdir: str, filename: str) -> Optional[str]:
     try:
         from openpyxl import Workbook  # type: ignore
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE  # type: ignore
     except Exception:
         return None
     path = os.path.join(outdir, filename)
@@ -139,7 +169,13 @@ def write_xlsx(rows: List[dict], outdir: str, filename: str) -> Optional[str]:
     headers = list(rows[0].keys()) if rows else ["MAC"]
     ws.append(headers)
     for r in rows:
-        ws.append([r.get(h, NO_DATA) for h in headers])
+        safe_values = []
+        for h in headers:
+            value = clean_report_value(r.get(h, NO_DATA))
+            if isinstance(value, str):
+                value = ILLEGAL_CHARACTERS_RE.sub("", value)
+            safe_values.append(value)
+        ws.append(safe_values)
     ws.freeze_panes = "A2"
     wb.save(path)
     return path

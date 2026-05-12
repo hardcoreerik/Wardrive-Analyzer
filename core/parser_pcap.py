@@ -29,6 +29,28 @@ try:
 except ImportError:
     _DPKT_OK = False
 
+# Per-file packet cap — prevents multi-minute hangs on huge raw captures (e.g. 100MB+ files).
+# 802.11 management frames are ~300 bytes each; 2M packets ≈ ~600MB of 802.11 data max.
+_MAX_PACKETS_PER_FILE = 2_000_000
+
+# Files larger than this (bytes) get a status warning before parsing begins.
+_LARGE_FILE_WARN_BYTES = 50 * 1024 * 1024  # 50 MB
+
+_SSID_MAX_CHARS = 128
+
+
+def _clean_ssid_text(text: str) -> str:
+    cleaned = "".join(
+        ch if (ch.isprintable() and ch not in "\x00\r\n\t") else "?"
+        for ch in text
+    )
+    cleaned = cleaned.replace("\ufffd", "?").strip()
+    if not cleaned:
+        return "<HIDDEN>"
+    if len(cleaned) > _SSID_MAX_CHARS:
+        return cleaned[:_SSID_MAX_CHARS] + "...[truncated]"
+    return cleaned
+
 
 # ---------------------------------------------------------------------------
 # Frame-type constants (802.11)
@@ -124,7 +146,7 @@ def _parse_ssid_from_ie(payload: bytes) -> str:
         if ie_id == 0:  # SSID IE
             raw = payload[i + 2: i + 2 + ie_len]
             try:
-                return raw.decode("utf-8", errors="replace").strip() or "<HIDDEN>"
+                return _clean_ssid_text(raw.decode("utf-8", errors="replace"))
             except Exception:
                 return "<HIDDEN>"
         i += 2 + ie_len
@@ -178,6 +200,10 @@ def _parse_one_pcap(pcap_path: str) -> _PerFileResult:
         return result
 
     try:
+        file_size = os.path.getsize(pcap_path)
+        if file_size > _LARGE_FILE_WARN_BYTES:
+            result.error = f"large file ({file_size // (1024*1024)}MB) — parsing capped at {_MAX_PACKETS_PER_FILE:,} packets"
+
         with open(pcap_path, "rb") as f:
             try:
                 cap = dpkt.pcap.Reader(f)
@@ -189,8 +215,14 @@ def _parse_one_pcap(pcap_path: str) -> _PerFileResult:
                     result.error = str(e)
                     return result
 
+            packet_count = 0
             for _ts, buf in cap:
                 _process_frame(buf, result)
+                packet_count += 1
+                if packet_count >= _MAX_PACKETS_PER_FILE:
+                    if not result.error:
+                        result.error = f"truncated at {_MAX_PACKETS_PER_FILE:,} packets"
+                    break
     except Exception as e:
         result.error = str(e)
 
@@ -377,6 +409,19 @@ def load_pcaps(
     total = len(pcap_files)
     lock = threading.Lock()
     completed = [0]
+
+    # Warn up front about large files so the user sees them before the parser blocks.
+    if status_cb:
+        for p in pcap_files:
+            try:
+                sz = os.path.getsize(p)
+                if sz > _LARGE_FILE_WARN_BYTES:
+                    status_cb(
+                        f"    [warn] large file ({sz // (1024*1024)}MB) — "
+                        f"will cap at {_MAX_PACKETS_PER_FILE:,} packets: {os.path.basename(p)}"
+                    )
+            except OSError:
+                pass
 
     def _work(path: str) -> _PerFileResult:
         return _parse_one_pcap(path)

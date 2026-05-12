@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import platform
 import random
 import subprocess
 import hashlib
@@ -9,6 +10,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from error_logger import write_error_report
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QElapsedTimer, QRect, QRectF, QPointF, QUrl
 from PySide6.QtGui import QPainter, QLinearGradient, QColor, QFont, QPen, QBrush, QPixmap, QDesktopServices, QMovie
@@ -99,235 +101,446 @@ def file_fingerprint(path: str) -> str:
 
 
 # -----------------------------
-# Procedural cyberpunk background (Qt painter)
+# Procedural animated background (QPainter, full-window, per-frame)
 # -----------------------------
+import math
+
+_MATRIX_CHARS = (
+    "ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
+    "0123456789ABCDEF<>[]{}|\\/*+-=~@#$%^&"
+)
+
+
 @dataclass
-class BgSeed:
-    a: int
-    b: int
-    c: int
-    mode: str
+class _MatrixDrop:
+    x: float
+    y: float        # head y position (pixels)
+    speed: float    # pixels per tick
+    trail: int      # number of chars in trail
+    chars: list     # pre-chosen char indices, len == trail + 1
 
 
-class CyberBackground(QWidget):
-    MODES = ["pixel_demo_gif", "grid_horizon", "circuit_board", "matrix_rain", "nebula_noise"]
+@dataclass
+class _CircuitNode:
+    x: float
+    y: float
+    phase_offset: float  # per-node brightness phase
+
+
+@dataclass
+class _CircuitTrace:
+    n1: int   # index into nodes list
+    n2: int
+    signal_t: float        # 0..1, position of traveling signal along trace
+    signal_speed: float    # units per tick (0.003 – 0.012)
+
+
+@dataclass
+class _NebulaBlob:
+    cx: float
+    cy: float
+    rx: float
+    ry: float
+    hue: int
+    vx: float   # pixels per tick
+    vy: float
+    phase_offset: float
+
+
+class ProceduralBackground(QWidget):
+    """Full-window animated background — pure QPainter, no static pixmap, no GIFs."""
+
+    MODES = ["grid_horizon", "circuit_board", "matrix_rain", "nebula_noise"]
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAutoFillBackground(False)
 
-        # Pixel demoscene GIF layer (behind UI)
-        self.gif_label = QLabel(self)
-        self.gif_label.setScaledContents(True)
-        self.gif_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.gif_label.hide()
+        # GIF fallback layer (shown only if gif_paths supplied and mode == gif)
+        self._gif_label = QLabel(self)
+        self._gif_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._gif_label.hide()
         self._movie: QMovie | None = None
-        self._gif_choice: str | None = None
 
-        self.seed = BgSeed(0, 0, 0, "grid_horizon")
+        self.mode: str = "grid_horizon"
+        self.phase: float = 0.0
+        self.current_name: str = "grid_horizon"
+
+        # Per-mode state (rebuilt on regenerate / resize)
+        self._drops: list[_MatrixDrop] = []
+        self._circuit_nodes: list[_CircuitNode] = []
+        self._circuit_traces: list[_CircuitTrace] = []
+        self._nebula_blobs: list[_NebulaBlob] = []
+        self._rng_seed: int = random.randint(0, 10_000_000)
+        self._hue_base: int = random.randint(0, 359)
+        self._last_w: int = 0
+        self._last_h: int = 0
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)   # ~60 fps
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+        self.randomize()
+
+    # ------------------------------------------------------------------
+    # Public API (matches old DemoscenePanel for drop-in replacement)
+    # ------------------------------------------------------------------
+
+    def randomize(self) -> None:
+        self.set_mode(random.choice(self.MODES))
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.current_name = mode
         self.phase = 0.0
-        self._static = QPixmap()
-        self._drops: list[tuple[float, float, float]] = []
+        self._rng_seed = random.randint(0, 10_000_000)
+        self._hue_base = random.randint(0, 359)
+        self._rebuild_state()
+        self.update()
 
-        self.regenerate(initial=True)
+    # ------------------------------------------------------------------
+    # State initialisation (called on set_mode + resize)
+    # ------------------------------------------------------------------
 
-        self._anim = QTimer(self)
-        self._anim.setInterval(16)
-        self._anim.timeout.connect(self._tick)
-        self._anim.start()
+    def _rebuild_state(self) -> None:
+        w, h = self.width(), self.height()
+        self._last_w, self._last_h = w, h
+        rng = random.Random(self._rng_seed)
 
-    def regenerate(self, initial: bool = False):
-        self.seed = BgSeed(
-            random.randint(0, 10_000_000),
-            random.randint(0, 10_000_000),
-            random.randint(0, 10_000_000),
-            random.choices(self.MODES, weights=[6,1,1,1,1], k=1)[0],
-        )
-        self.phase = 0.0
-        self._static = QPixmap()
+        if self.mode == "matrix_rain":
+            self._build_matrix(w, h, rng)
+        elif self.mode == "circuit_board":
+            self._build_circuit(w, h, rng)
+        elif self.mode == "nebula_noise":
+            self._build_nebula(w, h, rng)
+        # grid_horizon: fully stateless, driven only by phase
+
+    def _build_matrix(self, w: int, h: int, rng: random.Random) -> None:
+        if w <= 0 or h <= 0:
+            return
+        col_w = 18
+        cols = max(1, w // col_w)
         self._drops = []
-        self._apply_mode()
-        if not initial:
-            self.update()
+        for i in range(cols):
+            trail = rng.randint(8, 28)
+            self._drops.append(_MatrixDrop(
+                x=i * col_w + rng.randint(0, col_w // 2),
+                y=rng.random() * h,
+                speed=rng.uniform(1.5, 5.0),
+                trail=trail,
+                chars=[rng.randint(0, len(_MATRIX_CHARS) - 1) for _ in range(trail + 1)],
+            ))
 
-    def _apply_mode(self):
-        # If pixel_demo_gif: load one of our baked GIFs and let QMovie animate it.
-        if self.seed.mode == "pixel_demo_gif":
-            choice = random.choice(ASSET_GIFS)
-            if choice != self._gif_choice:
-                self._gif_choice = choice
-                try:
-                    path = resource_path(choice)
-                    mv = QMovie(path)
-                    self._movie = mv
-                    self.gif_label.setMovie(mv)
-                    mv.start()
-                except Exception:
-                    self._movie = None
-            self.gif_label.show()
-        else:
-            self.gif_label.hide()
-            if self._movie:
-                try:
-                    self._movie.stop()
-                except Exception:
-                    pass
-                self._movie = None
-            self._gif_choice = None
+    def _build_circuit(self, w: int, h: int, rng: random.Random) -> None:
+        if w <= 0 or h <= 0:
+            return
+        n_nodes = 60
+        self._circuit_nodes = [
+            _CircuitNode(
+                x=rng.random() * w,
+                y=rng.random() * h,
+                phase_offset=rng.random() * math.tau,
+            )
+            for _ in range(n_nodes)
+        ]
+        # Connect each node to 1-3 neighbours picked by proximity
+        self._circuit_traces = []
+        for i, nd in enumerate(self._circuit_nodes):
+            candidates = sorted(
+                (j for j in range(n_nodes) if j != i),
+                key=lambda j: (self._circuit_nodes[j].x - nd.x) ** 2 + (self._circuit_nodes[j].y - nd.y) ** 2,
+            )
+            for j in candidates[: rng.randint(1, 3)]:
+                self._circuit_traces.append(_CircuitTrace(
+                    n1=i, n2=j,
+                    signal_t=rng.random(),
+                    signal_speed=rng.uniform(0.002, 0.010),
+                ))
+
+    def _build_nebula(self, w: int, h: int, rng: random.Random) -> None:
+        if w <= 0 or h <= 0:
+            return
+        self._nebula_blobs = [
+            _NebulaBlob(
+                cx=rng.random() * w,
+                cy=rng.random() * h,
+                rx=(0.15 + rng.random() * 0.55) * w,
+                ry=(0.10 + rng.random() * 0.45) * h,
+                hue=rng.randint(0, 359),
+                vx=rng.uniform(-0.25, 0.25),
+                vy=rng.uniform(-0.15, 0.15),
+                phase_offset=rng.random() * math.tau,
+            )
+            for _ in range(12)
+        ]
+
+    # ------------------------------------------------------------------
+    # Animation tick
+    # ------------------------------------------------------------------
+
+    def _tick(self) -> None:
+        self.phase += 0.05
+        if self.phase > 99999:
+            self.phase = 0.0
+
+        w, h = self.width(), self.height()
+        if w != self._last_w or h != self._last_h:
+            self._rebuild_state()
+
+        if self.mode == "matrix_rain":
+            self._step_matrix(h)
+        elif self.mode == "circuit_board":
+            self._step_circuit()
+        elif self.mode == "nebula_noise":
+            self._step_nebula(w, h)
+
+        self.update()
+
+    def _step_matrix(self, h: int) -> None:
+        rng = random.Random()
+        for drop in self._drops:
+            drop.y += drop.speed
+            if drop.y - drop.trail * 18 > h + 40:
+                drop.y = -rng.randint(10, 80)
+                drop.speed = rng.uniform(1.5, 5.0)
+                drop.trail = rng.randint(8, 28)
+                drop.chars = [rng.randint(0, len(_MATRIX_CHARS) - 1) for _ in range(drop.trail + 1)]
+            # Randomly mutate head char for flicker
+            if rng.random() < 0.15:
+                drop.chars[0] = rng.randint(0, len(_MATRIX_CHARS) - 1)
+
+    def _step_circuit(self) -> None:
+        for trace in self._circuit_traces:
+            trace.signal_t += trace.signal_speed
+            if trace.signal_t > 1.0:
+                trace.signal_t = 0.0
+
+    def _step_nebula(self, w: int, h: int) -> None:
+        margin = 200
+        for b in self._nebula_blobs:
+            b.cx += b.vx
+            b.cy += b.vy
+            if b.cx < -margin:
+                b.cx = w + margin
+            elif b.cx > w + margin:
+                b.cx = -margin
+            if b.cy < -margin:
+                b.cy = h + margin
+            elif b.cy > h + margin:
+                b.cy = -margin
+
+    # ------------------------------------------------------------------
+    # Painting
+    # ------------------------------------------------------------------
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.gif_label.setGeometry(0, 0, self.width(), self.height())
+        self._gif_label.setGeometry(0, 0, self.width(), self.height())
 
-    def _tick(self):
-        self.phase += 0.04
-        if self.phase > 9999:
-            self.phase = 0.0
-        self.update()
-
-    def _ensure_static(self):
+    def paintEvent(self, event):
         w, h = self.width(), self.height()
         if w <= 2 or h <= 2:
             return
-        if not self._static.isNull() and self._static.size().width() == w and self._static.size().height() == h:
-            return
 
-        pm = QPixmap(w, h)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
+        p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
 
-        g = QLinearGradient(0, 0, w, h)
-        hue1 = (self.seed.a % 360)
-        hue2 = (self.seed.b % 360)
-        c1 = QColor.fromHsl(hue1, 180, 25)
-        c2 = QColor.fromHsl(hue2, 200, 12)
-        g.setColorAt(0.0, QColor(3, 5, 6))
-        g.setColorAt(0.35, c2)
-        g.setColorAt(0.75, c1)
-        g.setColorAt(1.0, QColor(0, 0, 0))
-        p.fillRect(pm.rect(), g)
+        # Base gradient — deep black/midnight
+        bg = QLinearGradient(0, 0, 0, h)
+        bg.setColorAt(0.0, QColor(2, 4, 8))
+        bg.setColorAt(1.0, QColor(0, 0, 0))
+        p.fillRect(0, 0, w, h, bg)
 
-        rng = random.Random(self.seed.c)
+        if self.mode == "matrix_rain":
+            self._paint_matrix(p, w, h)
+        elif self.mode == "circuit_board":
+            self._paint_circuit(p, w, h)
+        elif self.mode == "nebula_noise":
+            self._paint_nebula(p, w, h)
+        elif self.mode == "grid_horizon":
+            self._paint_horizon(p, w, h)
 
-        if self.seed.mode == "grid_horizon":
-            self._draw_horizon_grid(p, w, h, rng)
-        elif self.seed.mode == "circuit_board":
-            self._draw_circuit(p, w, h, rng)
-        elif self.seed.mode == "matrix_rain":
-            p.fillRect(pm.rect(), QColor(0, 0, 0, 60))
-        elif self.seed.mode == "nebula_noise":
-            self._draw_nebula(p, w, h, rng)
+        # Scanline overlay (subtle)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        for y in range(0, h, 3):
+            p.fillRect(0, y, w, 1, QColor(0, 0, 0, 18))
 
-        vign = QLinearGradient(w * 0.5, h * 0.5, w * 0.5, h)
+        # Bottom vignette
+        vign = QLinearGradient(0, h * 0.6, 0, h)
         vign.setColorAt(0.0, QColor(0, 0, 0, 0))
-        vign.setColorAt(1.0, QColor(0, 0, 0, 190))
-        p.fillRect(pm.rect(), vign)
-
-        p.setPen(QPen(QColor(0, 255, 204, 35), 1))
-        font = QFont("Consolas")
-        font.setPointSize(9)
-        p.setFont(font)
-        glyphs = ["0xDEAD", "0xBEEF", "WIGLE", "PCAP", "RSSI", "BSSID", "SCAN", "NODE", "RUN"]
-        for _ in range(18):
-            txt = rng.choice(glyphs)
-            x = rng.randint(0, max(1, w - 60))
-            y = rng.randint(20, max(21, h - 10))
-            p.drawText(QPointF(x, y), txt)
+        vign.setColorAt(1.0, QColor(0, 0, 0, 180))
+        p.fillRect(0, 0, w, h, vign)
 
         p.end()
-        self._static = pm
 
-        if self.seed.mode == "matrix_rain":
-            cols = max(10, w // 20)
-            self._drops = [(i * (w / cols), rng.random() * h, 30 + rng.random() * 120) for i in range(cols)]
+    # --- Matrix rain ---
+    def _paint_matrix(self, p: QPainter, w: int, h: int) -> None:
+        p.setRenderHint(QPainter.Antialiasing, False)
+        font = QFont("Consolas", 12)
+        p.setFont(font)
+        fm_h = 16  # approximate char cell height
 
-    def _draw_horizon_grid(self, p: QPainter, w: int, h: int, rng: random.Random):
-        for _ in range(6):
-            x = rng.random() * w
-            y = rng.random() * h
-            rw = (0.25 + rng.random() * 0.6) * w
-            rh = (0.15 + rng.random() * 0.5) * h
-            hue = rng.randint(0, 359)
-            col = QColor.fromHsl(hue, 220, 55, 28)
+        for drop in self._drops:
+            head_y = drop.y
+            for i, ci in enumerate(drop.chars):
+                char_y = head_y - i * fm_h
+                if char_y < -fm_h or char_y > h + fm_h:
+                    continue
+                ch = _MATRIX_CHARS[ci]
+                if i == 0:
+                    # Head: bright white-green
+                    p.setPen(QColor(200, 255, 200, 255))
+                else:
+                    # Trail: exponential fade
+                    fade = int(255 * (0.85 ** i))
+                    green = max(80, 255 - i * 12)
+                    p.setPen(QColor(0, green, 50, fade))
+                p.drawText(QPointF(drop.x, char_y), ch)
+
+    # --- Circuit board ---
+    def _paint_circuit(self, p: QPainter, w: int, h: int) -> None:
+        nodes = self._circuit_nodes
+        if not nodes:
+            return
+
+        # Draw traces
+        p.setRenderHint(QPainter.Antialiasing, False)
+        for trace in self._circuit_traces:
+            n1 = nodes[trace.n1]
+            n2 = nodes[trace.n2]
+            p.setPen(QPen(QColor(0, 200, 160, 35), 1))
+            # L-shaped trace (one horizontal + one vertical segment)
+            mid_x = n2.x
+            mid_y = n1.y
+            p.drawLine(int(n1.x), int(n1.y), int(mid_x), int(mid_y))
+            p.drawLine(int(mid_x), int(mid_y), int(n2.x), int(n2.y))
+
+            # Traveling signal dot
+            t = trace.signal_t
+            if t < 0.5:
+                sx = n1.x + (mid_x - n1.x) * (t * 2)
+                sy = n1.y
+            else:
+                sx = mid_x
+                sy = mid_y + (n2.y - mid_y) * ((t - 0.5) * 2)
+            sig_alpha = int(180 + 75 * math.sin(self.phase * 3))
+            p.fillRect(int(sx) - 2, int(sy) - 2, 4, 4, QColor(0, 255, 200, sig_alpha))
+
+        # Draw nodes with pulsing brightness
+        p.setRenderHint(QPainter.Antialiasing, True)
+        for nd in nodes:
+            pulse = 0.5 + 0.5 * math.sin(self.phase * 2.5 + nd.phase_offset)
+            alpha = int(60 + 140 * pulse)
+            size = 3 + int(3 * pulse)
+            p.setBrush(QBrush(QColor(0, 255, 190, alpha)))
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(QPointF(nd.x, nd.y), size, size)
+
+    # --- Nebula noise ---
+    def _paint_nebula(self, p: QPainter, w: int, h: int) -> None:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        for b in self._nebula_blobs:
+            pulse = 0.5 + 0.5 * math.sin(self.phase * 1.2 + b.phase_offset)
+            alpha = int(12 + 18 * pulse)
+            hue = (b.hue + int(self.phase * 8)) % 360
+            col = QColor.fromHsl(hue, 200, 55, alpha)
             p.setBrush(QBrush(col))
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QRectF(x - rw / 2, y - rh / 2, rw, rh))
+            p.drawEllipse(QRectF(b.cx - b.rx, b.cy - b.ry, b.rx * 2, b.ry * 2))
 
+        # Faint star field
         p.setRenderHint(QPainter.Antialiasing, False)
-        grid_y = int(h * 0.70)
+        rng = random.Random(self._rng_seed ^ 0xABCD)
+        for _ in range(80):
+            sx = rng.randint(0, w)
+            sy = rng.randint(0, h)
+            twinkle = int(60 + 60 * math.sin(self.phase * 2.1 + sx * 0.07 + sy * 0.05))
+            p.fillRect(sx, sy, 1, 1, QColor(255, 255, 255, twinkle))
+
+    # --- Synthwave horizon grid ---
+    def _paint_horizon(self, p: QPainter, w: int, h: int) -> None:
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # Dusk sky gradient (magenta → deep blue)
+        sky = QLinearGradient(0, 0, 0, h * 0.60)
+        sky.setColorAt(0.0, QColor(8, 2, 22))
+        sky.setColorAt(0.6, QColor(80, 10, 60))
+        sky.setColorAt(1.0, QColor(180, 30, 100))
+        p.fillRect(0, 0, w, int(h * 0.60), sky)
+
+        # Animated sun glow at horizon
+        sun_cx = w * 0.5
+        sun_cy = h * 0.55
+        sun_r = w * 0.18
+        pulse = 0.5 + 0.5 * math.sin(self.phase * 0.6)
+        glow_r = sun_r * (1.0 + 0.15 * pulse)
+        glow = QLinearGradient(sun_cx - glow_r, sun_cy - glow_r, sun_cx + glow_r, sun_cy + glow_r)
+        glow.setColorAt(0.0, QColor(255, 100, 30, 90))
+        glow.setColorAt(0.5, QColor(255, 60, 80, 45))
+        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(QBrush(glow))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(QPointF(sun_cx, sun_cy), glow_r, glow_r * 0.65)
+
+        # Sun disc with horizontal scan lines (retro style)
+        p.setBrush(QBrush(QColor(255, 120, 40, 220)))
+        p.drawEllipse(QPointF(sun_cx, sun_cy), sun_r, sun_r * 0.55)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.setClipRect(QRect(int(sun_cx - sun_r), int(sun_cy - sun_r * 0.55),
+                            int(sun_r * 2), int(sun_r * 1.1)))
+        for i in range(1, 10):
+            y = sun_cy + (sun_r * 0.55) * (i / 10.0) * 2 - sun_r * 0.55
+            a = max(0, 200 - i * 18)
+            p.fillRect(0, int(y), w, 3, QColor(20, 0, 10, a))
+        p.setClipping(False)
+
+        # Floor
+        floor_top = int(h * 0.55)
+        floor = QLinearGradient(0, floor_top, 0, h)
+        floor.setColorAt(0.0, QColor(30, 0, 50))
+        floor.setColorAt(1.0, QColor(5, 0, 15))
+        p.fillRect(0, floor_top, w, h - floor_top, floor)
+
+        # Vertical perspective lines (fan out from vanishing point)
         van_x = w * 0.5
         van_y = h * 0.55
-        for i in range(-18, 19):
-            x = van_x + i * (w * 0.06)
-            p.setPen(QPen(QColor(0, 255, 170, 60), 1))
-            p.drawLine(int(x), grid_y, int(van_x), int(van_y))
-        for i in range(1, 26):
-            y = grid_y + int((i ** 1.35) * (h * 0.008))
-            if y >= h:
-                break
-            alpha = max(10, 70 - i * 2)
-            p.setPen(QPen(QColor(0, 255, 170, alpha), 1))
-            p.drawLine(0, y, w, y)
-
-    def _draw_circuit(self, p: QPainter, w: int, h: int, rng: random.Random):
-        p.setRenderHint(QPainter.Antialiasing, False)
-        for _ in range(120):
-            x1 = rng.randint(0, w)
-            y1 = rng.randint(0, h)
-            x2 = x1 + rng.randint(-120, 120)
-            y2 = y1 + rng.randint(-120, 120)
-            col = QColor(0, 255, 208, rng.randint(15, 60))
-            p.setPen(QPen(col, 1))
-            p.drawLine(x1, y1, x2, y1)
-            p.drawLine(x2, y1, x2, y2)
-            p.fillRect(max(0, x2 - 2), max(0, y2 - 2), 4, 4, QColor(0, 255, 208, rng.randint(30, 80)))
-
-    def _draw_nebula(self, p: QPainter, w: int, h: int, rng: random.Random):
         p.setRenderHint(QPainter.Antialiasing, True)
-        for _ in range(10):
-            x = rng.random() * w
-            y = rng.random() * h
-            rw = (0.2 + rng.random() * 0.8) * w
-            rh = (0.2 + rng.random() * 0.7) * h
-            hue = rng.randint(0, 359)
-            col = QColor.fromHsl(hue, 180, 40, 22)
-            p.setBrush(QBrush(col))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(QRectF(x - rw / 2, y - rh / 2, rw, rh))
+        for i in range(-14, 15):
+            x_bottom = van_x + i * (w * 0.075)
+            alpha = max(20, 90 - abs(i) * 4)
+            p.setPen(QPen(QColor(255, 0, 200, alpha), 1))
+            p.drawLine(int(van_x), int(van_y), int(x_bottom), h)
 
-    def paintEvent(self, event):
-        if self.seed.mode == "pixel_demo_gif":
-            # GIF handled by QLabel/QMovie.
-            return
-        self._ensure_static()
-        painter = QPainter(self)
-        painter.drawPixmap(0, 0, self._static)
-
-        w, h = self.width(), self.height()
-
-        painter.setRenderHint(QPainter.Antialiasing, False)
-        for y in range(0, h, 4):
-            a = 10 if (int(self.phase * 10) + y) % 12 else 20
-            painter.fillRect(0, y, w, 1, QColor(0, 255, 150, a))
-
-        if self.seed.mode == "matrix_rain" and self._drops:
-            painter.setPen(QPen(QColor(0, 255, 120, 90), 1))
-            font = QFont("Consolas")
-            font.setPointSize(10)
-            painter.setFont(font)
-            for i, (x, y, spd) in enumerate(self._drops):
-                y2 = (y + self.phase * spd) % (h + 100)
-                txt = chr(33 + ((int(x + y2) + i) % 60))
-                painter.drawText(QPointF(x, y2), txt)
-
-        painter.end()
+        # Horizontal lines scrolling toward viewer (perspective spacing)
+        scroll = (self.phase * 12) % 1.0  # fractional scroll offset
+        n_lines = 24
+        for i in range(n_lines):
+            t = ((i + scroll) / n_lines) ** 2.2   # perspective warp
+            y = int(van_y + (h - van_y) * t)
+            if y <= floor_top or y > h:
+                continue
+            alpha = int(15 + 65 * t)
+            p.setPen(QPen(QColor(255, 0, 200, alpha), 1))
+            p.drawLine(0, y, w, y)
 
 
 # -----------------------------
 # Analyzer worker thread
 # -----------------------------
+_GUI_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F-\x9F]")
+
+
+def _safe_gui_text(value, limit: int = 4000) -> str:
+    text = str(value) if value is not None else ""
+    text = _GUI_TEXT_CONTROL_RE.sub("", text)
+    text = text.replace("\ufffd", "?")
+    if len(text) > limit:
+        text = text[:limit] + "\n... [truncated]"
+    return text
+
+
 class AnalyzeWorker(QThread):
     stage = Signal(str)
     done = Signal(dict)
@@ -345,6 +558,7 @@ class AnalyzeWorker(QThread):
     def run(self):
         try:
             def cb(msg: str):
+                msg = _safe_gui_text(msg, limit=1200)
                 self.stage.emit(msg)
 
                 # Heuristic progress extraction from core log lines.
@@ -369,86 +583,102 @@ class AnalyzeWorker(QThread):
             self.stage.emit("Complete.")
             self.done.emit(results)
         except Exception as e:
+            import traceback as _tb
+            err = _safe_gui_text(f"{type(e).__name__}: {e}", limit=1200)
+            trace = _safe_gui_text(_tb.format_exc(), limit=4000)
+            report = write_error_report(
+                "analysis_worker_failure",
+                e,
+                context={
+                    "project_dir": self.project_dir,
+                    "wardrive_files": len(self.wardrive_files),
+                    "pcap_files": len(self.pcap_files),
+                },
+                traceback_text=trace,
+            )
+            self.stage.emit(f"[CRASH] {err}")
+            self.stage.emit(f"Error report written: {report}")
+            self.stage.emit(trace)
+            self.failed.emit(f"{err}\n\nReport: {report}")
+
+
+# -----------------------------
+# Ingest worker thread
+# -----------------------------
+class ScanWorker(QThread):
+    """Runs scan_sd_folder on a background thread so the GUI stays live."""
+    done   = Signal(list)   # list[CandidateFile]
+    failed = Signal(str)
+
+    def __init__(self, folder: str):
+        super().__init__()
+        self.folder = folder
+
+    def run(self):
+        try:
+            candidates = scan_sd_folder(self.folder)
+            self.done.emit(candidates)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class IngestWorker(QThread):
+    stage         = Signal(str)            # log line (throttled)
+    progress      = Signal(int, int)       # (files_done, files_total)
+    file_progress = Signal(str, str, int, int)  # (filename, phase, bytes_done, bytes_total)
+    done          = Signal(dict)
+    failed        = Signal(str)
+
+    # Emit a stage signal at most every N files to avoid flooding the event loop
+    _SIGNAL_EVERY = 5
+
+    def __init__(self, project_dir: str, sd_root: str,
+                 candidates: list, label: str, skip_duplicates: bool):
+        super().__init__()
+        self.project_dir     = project_dir
+        self.sd_root         = sd_root
+        self.candidates      = candidates
+        self.label           = label
+        self.skip_duplicates = skip_duplicates
+        self._total          = len(candidates)
+        self._done_count     = 0
+
+    def run(self):
+        try:
+            every = max(1, self._SIGNAL_EVERY)
+
+            def cb(msg: str):
+                self._done_count += 1
+                is_notable = (
+                    msg.startswith("ERROR")
+                    or msg.startswith("Duplicate")
+                    or self._done_count % every == 0
+                    or self._done_count == self._total
+                )
+                if is_notable:
+                    self.stage.emit(msg)
+                self.progress.emit(self._done_count, self._total)
+
+            def file_cb(filename: str, phase: str, done: int, total: int):
+                self.file_progress.emit(filename, phase, done, total)
+
+            stats = ingest_candidates_to_project(
+                project_dir=self.project_dir,
+                sd_root=self.sd_root,
+                candidates=self.candidates,
+                label=self.label,
+                skip_duplicates=self.skip_duplicates,
+                progress_cb=cb,
+                file_progress_cb=file_cb,
+            )
+            self.done.emit(stats)
+        except Exception as e:
             self.failed.emit(str(e))
 
 
 # -----------------------------
 # Main GUI
 # -----------------------------
-
-class DemoscenePanel(QWidget):
-    """Right-side pixel demoscene GIF panel.
-
-    Renders the *right side* of the GIF as the focal point (scaled-to-fill, cropped, anchored right).
-    """
-
-    def __init__(self, parent: QWidget | None = None, gif_paths: list[str] | None = None):
-        super().__init__(parent)
-        self.setObjectName("DemoscenePanel")
-        self._gif_paths = gif_paths or ASSET_GIFS
-        self._movie: QMovie | None = None
-        self.current_name = "(none)"
-        self._start_random()
-
-    def _start_random(self) -> None:
-        if not self._gif_paths:
-            return
-        path = random.choice(self._gif_paths)
-        self.set_gif(path)
-
-    def randomize(self) -> None:
-        self._start_random()
-
-    def set_gif(self, path: str) -> None:
-        abspath = resource_path(path)
-        if not os.path.exists(abspath):
-            # Try relative to current working dir as a fallback
-            if os.path.exists(path):
-                abspath = path
-            else:
-                return
-        if self._movie:
-            self._movie.stop()
-        self._movie = QMovie(abspath)
-        self._movie.setCacheMode(QMovie.CacheMode.CacheAll)
-        self._movie.frameChanged.connect(lambda _=None: self.update())
-        self._movie.start()
-        self.current_name = os.path.basename(path)
-
-    def paintEvent(self, event):  # noqa: N802
-        super().paintEvent(event)
-        if not self._movie:
-            return
-        pix = self._movie.currentPixmap()
-        if pix.isNull():
-            return
-
-        w = self.width()
-        h = self.height()
-        if w <= 0 or h <= 0:
-            return
-
-        # Scale-to-fill while preserving aspect ratio
-        pw = pix.width()
-        ph = pix.height()
-        if pw <= 0 or ph <= 0:
-            return
-
-        sx = w / pw
-        sy = h / ph
-        s = max(sx, sy)
-        sw = int(pw * s)
-        sh = int(ph * s)
-
-        # Anchor RIGHT: place scaled pix so its right edge aligns with widget right edge
-        x = w - sw
-        y = (h - sh) // 2
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawPixmap(QRect(x, y, sw, sh), pix, QRect(0, 0, pw, ph))
-        painter.end()
-
 
 class WardriveGUI(QWidget):
     def __init__(self):
@@ -475,6 +705,13 @@ class WardriveGUI(QWidget):
         self._jobs: list[dict] = []
         self._active_job_id: int | None = None
         self._analysis_thread = None
+        self._ingest_worker: IngestWorker | None = None
+        self._ingest_job_id: int | None = None
+        self._ingest_total: int = 0
+        self._ingest_file_active: bool = False
+        self._scan_worker: ScanWorker | None = None
+        self._scan_job_id: int | None = None
+        self._sd_scan_folder: str = ""
 
         # Run-state + progress / ETA tracking
         self._running: bool = False
@@ -487,8 +724,8 @@ class WardriveGUI(QWidget):
         # QSS first (so widgets created later inherit it)
         self._load_qss()
 
-        # Full-window background layer (pixel demoscene)
-        self.demoscene = DemoscenePanel(gif_paths=ASSET_GIFS)
+        # Full-window animated procedural background
+        self.demoscene = ProceduralBackground()
         self.demoscene.setObjectName("DemosceneBG")
 
         # Overlay layer (all interactive UI)
@@ -498,7 +735,7 @@ class WardriveGUI(QWidget):
 
         overlay.setStyleSheet(
             "QWidget#Overlay{background: transparent;}"
-            "QWidget#LeftPane{background-color: rgba(0,0,0,140); border: 1px solid rgba(0,255,220,80); border-radius: 14px;}"
+            "QWidget#LeftPane{background-color: rgba(0,0,0,110); border: 1px solid rgba(0,255,220,90); border-radius: 14px;}"
             "QWidget#RightPane{background: transparent;}"
         )
 
@@ -554,7 +791,11 @@ class WardriveGUI(QWidget):
         except Exception:
             pass
         self.refresh_mission_control()
-        self._log(f"Demoscene: {self.demoscene.current_name}")
+        self._log(f"Background: {self.demoscene.current_name}")
+
+        # Fire boot sequence after event loop starts (100ms delay)
+        QTimer.singleShot(100, self._boot_sequence)
+
     def _load_qss(self) -> None:
         """Load and apply the QSS theme (if present).
 
@@ -831,22 +1072,95 @@ class WardriveGUI(QWidget):
         panel.setObjectName("Panel")
         v = QVBoxLayout(panel)
         v.setContentsMargins(12, 12, 12, 12)
-        v.setSpacing(8)
+        v.setSpacing(6)
 
-        title = QLabel("Console / Operator Log")
+        hdr = QHBoxLayout()
+        title = QLabel("CONSOLE // OPERATOR LOG")
         title.setObjectName("PanelTitle")
-        v.addWidget(title)
+        hdr.addWidget(title, 1)
 
-        # Big in-tab console (separate from the always-visible docked console)
+        btn_clear = QPushButton("Clear")
+        btn_clear.setFixedWidth(70)
+        btn_clear.clicked.connect(self._console_clear)
+        hdr.addWidget(btn_clear, 0)
+        v.addLayout(hdr)
+
         self.console_big = QTextEdit()
         self.console_big.setReadOnly(True)
         self.console_big.setObjectName("ConsoleBig")
-        self.console_big.setPlaceholderText(
-            "Output appears here while things run.\n"
-            "(If it looks idle, check STATUS + progress bar — no fake loading spinners in this basement.)"
+        # Tight monospace, no paragraph margins between lines
+        self.console_big.setStyleSheet(
+            "QTextEdit#ConsoleBig {"
+            "  background-color: rgba(0,0,0,180);"
+            "  color: #C8FFFA;"
+            "  font-family: Consolas, 'Courier New', monospace;"
+            "  font-size: 9pt;"
+            "  border: 1px solid rgba(0,255,220,80);"
+            "  border-radius: 10px;"
+            "}"
+        )
+        self.console_big.document().setDefaultStyleSheet(
+            "p { margin:0; padding:0; line-height: 1.25; }"
         )
         v.addWidget(self.console_big, 1)
         return panel
+
+    def _console_clear(self):
+        for attr in ("console_dock", "console_big"):
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                w.clear()
+            except Exception:
+                pass
+        self._log("Console cleared.", "BOOT")
+
+    def _boot_sequence(self):
+        """Emit a styled boot banner to the console after the UI is ready."""
+        divider = "─" * 56
+
+        # Check dpkt
+        try:
+            import dpkt as _dpkt
+            dpkt_ver = getattr(_dpkt, "__version__", "ok")
+            dpkt_status = f"dpkt {dpkt_ver} — native 802.11 parser ACTIVE"
+            dpkt_ok = True
+        except ImportError:
+            dpkt_status = "dpkt NOT FOUND — PCAP parsing disabled"
+            dpkt_ok = False
+
+        # Check openpyxl
+        try:
+            import openpyxl as _xl
+            xlsx_status = f"openpyxl {getattr(_xl, '__version__','ok')} — XLSX export ACTIVE"
+        except ImportError:
+            xlsx_status = "openpyxl NOT FOUND — XLSX export disabled"
+
+        # Check leaflet assets
+        leaflet_path = resource_path("assets", "leaflet", "leaflet.js")
+        leaflet_status = "Leaflet offline assets OK" if os.path.exists(leaflet_path) else "Leaflet offline assets MISSING (CDN fallback)"
+
+        seq = [
+            (0,   "BOOT",  divider),
+            (40,  "BOOT",  "  WARDRIVE MISSION CONTROL"),
+            (80,  "BOOT",  f"  Core: {CORE_REVISION}   |   Python {sys.version.split()[0]}"),
+            (120, "BOOT",  f"  OS: {platform.system()} {platform.release()} ({platform.machine()})"),
+            (160, "BOOT",  divider),
+            (220, "OK" if dpkt_ok else "ERROR", f"  {dpkt_status}"),
+            (270, "OK",    f"  {xlsx_status}"),
+            (320, "OK" if "OK" in leaflet_status else "WARN", f"  {leaflet_status}"),
+            (380, "BOOT",  divider),
+            (440, "INFO",  "  Select a Project Folder, then scan your SD card to begin."),
+            (500, "INFO",  "  All events — scans, ingests, analysis — are logged here."),
+            (560, "BOOT",  divider),
+            (620, "BOOT",  "  SYSTEM READY // awaiting operator input"),
+            (680, "BOOT",  divider),
+        ]
+
+        for delay_ms, level, msg in seq:
+            QTimer.singleShot(delay_ms, lambda lv=level, m=msg: self._log(m, lv))
+
     def _build_results_tab(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("Panel")
@@ -1135,7 +1449,8 @@ class WardriveGUI(QWidget):
         bg_row = QHBoxLayout()
         bg_row.addWidget(QLabel("Background mode:"))
         self.cmb_bg_mode = QComboBox()
-        self.cmb_bg_mode.addItems(["random_gif", "grid_horizon", "circuit_board", "matrix_rain", "nebula_noise"])
+        self.cmb_bg_mode.addItems(["random", "grid_horizon", "circuit_board", "matrix_rain", "nebula_noise"])
+        self.cmb_bg_mode.currentIndexChanged.connect(self._regen_bg)
         bg_row.addWidget(self.cmb_bg_mode)
         v.addLayout(bg_row)
 
@@ -1569,31 +1884,85 @@ class WardriveGUI(QWidget):
         pass
 
     def _regen_bg(self):
-        # Randomly pick a new demoscene background (full-window).
-        self.demoscene.randomize()
-        self._log(f"Demoscene: {self.demoscene.current_name}")
+        mode = self.cmb_bg_mode.currentText() if hasattr(self, "cmb_bg_mode") else "random"
+        if mode == "random" or mode not in ProceduralBackground.MODES:
+            self.demoscene.randomize()
+        else:
+            self.demoscene.set_mode(mode)
+        self._log(f"Background: {self.demoscene.current_name}")
 
     
 
-    def _log(self, msg: str):
+    # ------------------------------------------------------------------
+    # Console / logging
+    # ------------------------------------------------------------------
+    _LOG_STYLES: dict = {
+        # level  → (prefix, hex_color, plain_prefix)
+        "INFO":  ("[*]", "#C8FFFA", "[*]"),
+        "OK":    ("[+]", "#50FF90", "[+]"),
+        "WARN":  ("[!]", "#FFD080", "[!]"),
+        "ERROR": ("[X]", "#FF5555", "[X]"),
+        "DEBUG": ("[~]", "#7A9090", "[~]"),
+        "BOOT":  ("[>]", "#00FFCC", "[>]"),
+        "SCAN":  ("[S]", "#A0CFFF", "[S]"),
+    }
+
+    def _log(self, msg: str, level: str = "INFO"):
         stamp = datetime.now().strftime("%H:%M:%S")
-        line = f"[{stamp}] {msg}"
+        _, color, prefix = self._LOG_STYLES.get(level, self._LOG_STYLES["INFO"])
+        plain = f"[{stamp}] {prefix} {msg}"
+
         try:
-            logging.info(msg)
+            logging.info(plain)
         except Exception:
             pass
-        for attr in ("console_dock", "console_big"):
-            w = getattr(self, attr, None)
-            if w is None:
-                continue
+
+        # Dock → always plain text (compact strip)
+        dock = getattr(self, "console_dock", None)
+        if dock is not None:
             try:
-                # QPlainTextEdit supports appendPlainText; QTextEdit supports append.
-                if hasattr(w, "appendPlainText"):
-                    w.appendPlainText(line)
-                elif hasattr(w, "append"):
-                    w.append(line)
+                dock.appendPlainText(plain)
+                dock.verticalScrollBar().setValue(dock.verticalScrollBar().maximum())
             except Exception:
                 pass
+
+        # Big console → colored HTML
+        big = getattr(self, "console_big", None)
+        if big is not None:
+            try:
+                safe = (msg
+                        .replace("&", "&amp;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;"))
+                html = (
+                    f'<span style="color:#808080;">[{stamp}]</span> '
+                    f'<span style="color:{color}; font-weight:600;">{prefix}</span> '
+                    f'<span style="color:{color};">{safe}</span>'
+                )
+                big.append(html)
+                big.verticalScrollBar().setValue(big.verticalScrollBar().maximum())
+            except Exception:
+                pass
+
+    def _log_ok(self, msg: str):    self._log(msg, "OK")
+    def _log_warn(self, msg: str):  self._log(msg, "WARN")
+    def _log_err(self, msg: str):   self._log(msg, "ERROR")
+    def _log_debug(self, msg: str): self._log(msg, "DEBUG")
+    def _log_scan(self, msg: str):  self._log(msg, "SCAN")
+
+    def _log_from_core(self, msg: str):
+        """Route core/worker messages to the right log level by inspecting prefix."""
+        ml = msg.lstrip()
+        if ml.startswith("[warn]") or ml.startswith("    [warn]"):
+            self._log(msg, "WARN")
+        elif ml.startswith("ERROR") or ml.startswith("[X]"):
+            self._log(msg, "ERROR")
+        elif ml.startswith("[+]") or ml.startswith("Complete"):
+            self._log(msg, "OK")
+        elif ml.startswith("[*] P4R51NG") or ml.startswith("[*] WR1T1NG") or ml.startswith("[*] R3ND3R1NG"):
+            self._log(msg, "SCAN")
+        else:
+            self._log(msg, "INFO")
 
     def _open_path(self, path: str | None):
         if not path:
@@ -1881,15 +2250,11 @@ class WardriveGUI(QWidget):
             QMessageBox.warning(self, "Missing Project Folder", "Select a Project Folder first.")
             return
 
-        self._log("=== ANALYZE REQUESTED ===")
-        self._log("Logs = GPS evidence. PCAPs = radio evidence. Overlap = confidence.")
+        self._log(f"=== ANALYZE === {len(self.wardrive_files)} log(s) + {len(self.pcap_files)} PCAP(s)", "SCAN")
+        self._log("Wardrive logs = GPS evidence. PCAPs = radio/handshake evidence.", "INFO")
         job_id = self._new_job("Analysis", f"{len(self.wardrive_files)} logs, {len(self.pcap_files)} pcaps")
         self._set_running(True)
-
-        # Busy banner (big console + dock)
-        self._log('=== LIVE CONSOLE ENGAGED ===')
-        self._log('[*] 1N1T… b00t s3qu3nc3 // generating reports…')
-        self._log('[*] Stand by… parsing evidence + rendering HTML…')
+        self._log("Engine initializing — parsing evidence, computing centroids, rendering HTML…", "BOOT")
 
         # Snap to console so it feels alive while it runs
         try:
@@ -1899,7 +2264,7 @@ class WardriveGUI(QWidget):
 
         self.worker = AnalyzeWorker(self.wardrive_files, self.pcap_files, self.project_dir)
         self.worker._mission_job_id = job_id
-        self.worker.stage.connect(self._log)
+        self.worker.stage.connect(self._log_from_core)
         self.worker.progress.connect(self._on_progress)
         self.worker.done.connect(self._on_done)
         self.worker.failed.connect(self._on_failed)
@@ -1909,6 +2274,33 @@ class WardriveGUI(QWidget):
         except Exception:
             pass
         self.worker.start()
+
+        # Heartbeat timer: emit a console line every 5s while analysis is running
+        # so the user can see it has not frozen during long PCAP parsing.
+        self._analysis_heartbeat_secs = 0
+        self._analysis_heartbeat_timer = QTimer(self)
+        self._analysis_heartbeat_timer.setInterval(5000)
+        self._analysis_heartbeat_timer.timeout.connect(self._on_analysis_heartbeat)
+        self._analysis_heartbeat_timer.start()
+
+    def _on_analysis_heartbeat(self):
+        """Emit a periodic alive-signal to the console while analysis is running."""
+        if not getattr(self, "_running", False):
+            self._stop_analysis_heartbeat()
+            return
+        self._analysis_heartbeat_secs = getattr(self, "_analysis_heartbeat_secs", 0) + 5
+        elapsed = self._analysis_heartbeat_secs
+        mins, secs = divmod(elapsed, 60)
+        self._log(f"[*] Analysis running... {mins}m {secs:02d}s elapsed (parsing PCAPs / building reports)", "INFO")
+
+    def _stop_analysis_heartbeat(self):
+        t = getattr(self, "_analysis_heartbeat_timer", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+            self._analysis_heartbeat_timer = None
 
     def _on_progress(self, cur: int, tot: int, label: str):
         """Update footer progress bar + ETA using a moving average of per-step times."""
@@ -1973,6 +2365,7 @@ class WardriveGUI(QWidget):
                 pass
 
     def _on_done(self, results: dict):
+        self._stop_analysis_heartbeat()
         self._latest_summary = results.get("summary")
         self._latest_run_dir = results.get("run_dir")
         self._update_job(
@@ -2008,7 +2401,13 @@ class WardriveGUI(QWidget):
 
         QMessageBox.information(self, "Complete", msg)
 
-        self._log("Boot sequence complete. Awaiting next scan…")
+        self._log("=== ANALYSIS COMPLETE === all artifacts written.", "OK")
+        for k in ("csv", "xlsx", "map", "summary", "pcap_summary_html", "pcap_master_csv", "kml"):
+            if k in results:
+                try:
+                    self._log(f"  {k}: {os.path.basename(str(results[k]))}", "OK")
+                except Exception:
+                    pass
         self.refresh_mission_control()
 
         # Auto-open: prefer summary.html if available, else open the run folder
@@ -2048,8 +2447,18 @@ class WardriveGUI(QWidget):
             pass
 
     def _on_failed(self, err: str):
+        err = _safe_gui_text(err, limit=1200)
+        try:
+            report = write_error_report(
+                "analysis_failure",
+                context={"project_dir": self.project_dir, "error": err},
+            )
+            err = f"{err}\n\nReport: {report}"
+        except Exception:
+            pass
+        self._stop_analysis_heartbeat()
         self._set_running(False)
-        self._log(f"ERROR: {err}")
+        self._log_err(f"ANALYSIS FAILED: {err}")
         self._update_job(
             getattr(self, "_active_job_id", None),
             status="Failed",
@@ -2077,26 +2486,97 @@ class WardriveGUI(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select SD Folder")
         if not folder:
             return
-        self._sd_root = folder
-        self.lbl_sd_root.setText(f"SD folder: {folder}")
-        self._log(f"Scanning SD folder: {folder}")
-        job_id = self._new_job("SD Scan", folder)
-
-        try:
-            self._sd_candidates = scan_sd_folder(folder)
-        except Exception as e:
-            self._update_job(job_id, status="Failed", ended=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result=str(e))
-            QMessageBox.critical(self, "SD Scan Error", str(e))
+        if self._scan_worker is not None:
+            QMessageBox.information(self, "Busy", "SD scan already running.")
             return
 
+        self._sd_root = folder
+        self._sd_scan_folder = folder
+        self.lbl_sd_root.setText(f"SD folder: {folder}  [scanning…]")
+        self._log(f"=== SD SCAN === {folder}", "SCAN")
+        self._log("Walking directory tree… (UI stays live)", "INFO")
+
+        # Disable ingest buttons while scanning
+        try:
+            self.btn_sd_ingest.setEnabled(False)
+        except Exception:
+            pass
+
+        job_id = self._new_job("SD Scan", folder)
+        self._scan_job_id = job_id
+
+        worker = ScanWorker(folder)
+        self._scan_worker = worker
+        worker.done.connect(self._on_scan_done)
+        worker.failed.connect(self._on_scan_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        worker.start()
+
+    def _on_scan_done(self, candidates: list):
+        self._scan_worker = None
+        self._sd_candidates = candidates
+        folder = self._sd_scan_folder
+
+        from collections import Counter
+        by_kind: Counter = Counter(c.kind for c in candidates)
+        by_app:  Counter = Counter(c.source_app for c in candidates)
+        unknowns  = [c for c in candidates if c.source_app == "unknown"]
+        rec_count = sum(1 for c in candidates if c.recommended)
+        total_mb  = sum(c.size for c in candidates) / (1024 * 1024)
+
+        self._log_scan(f"Found {len(candidates)} files ({total_mb:.1f} MB)  |  {rec_count} recommended")
+        for app, n in sorted(by_app.items()):
+            self._log(f"  [{app}]  {n} file(s)", "OK" if app != "unknown" else "WARN")
+
+        self._log_scan("File types detected:")
+        for kind, n in sorted(by_kind.items()):
+            self._log(f"  {n:3d}  {kind}", "DEBUG")
+
+        large = [c for c in candidates if c.ext in (".pcap", ".pcapng") and c.size > 50 * 1024 * 1024]
+        for c in large:
+            self._log_warn(f"Large PCAP ({c.size // (1024 * 1024)}MB) — parse capped at 2M packets: {c.rel_path}")
+
+        if unknowns:
+            self._log_warn(f"{len(unknowns)} file(s) NOT recognized — will not be auto-selected:")
+            for c in unknowns:
+                self._log_warn(f"  UNKNOWN  {c.rel_path}  [{c.ext}]")
+        else:
+            self._log_ok("All files recognized.")
+
+        self.lbl_sd_root.setText(f"SD folder: {folder}")
         self._populate_sd_lists()
+
+        try:
+            self.btn_sd_ingest.setEnabled(True)
+        except Exception:
+            pass
+
         self._update_job(
-            job_id,
+            self._scan_job_id,
             status="Complete",
             ended=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            progress=f"{len(self._sd_candidates)} candidate file(s)",
+            progress=f"{len(candidates)} candidate file(s)",
             result=folder,
         )
+
+    def _on_scan_failed(self, err: str):
+        self._scan_worker = None
+        self._log_err(f"SD scan failed: {err}")
+        self.lbl_sd_root.setText("SD folder: (scan failed)")
+        try:
+            self.btn_sd_ingest.setEnabled(True)
+        except Exception:
+            pass
+        self._update_job(
+            self._scan_job_id,
+            status="Failed",
+            ended=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            result=err,
+        )
+        QMessageBox.critical(self, "SD Scan Error", err)
 
     def _populate_sd_lists(self):
         # Clear
@@ -2127,7 +2607,6 @@ class WardriveGUI(QWidget):
         self.lbl_sd_stats.setText(
             f"Found {total} file(s). Marauder: {counts['marauder']} | Porkchop: {counts['porkchop']} | Bruce: {counts['bruce']} | Nemo: {counts['nemo']} | Other: {counts['unknown']}."
         )
-        self._log(self.lbl_sd_stats.text())
 
     def _current_sd_list(self) -> QListWidget:
         # Single list mode (filters hide/show items)
@@ -2180,6 +2659,9 @@ class WardriveGUI(QWidget):
         if not self._sd_root:
             QMessageBox.warning(self, "Missing SD Folder", "Select an SD Folder first.")
             return
+        if getattr(self, "_ingest_worker", None) is not None:
+            QMessageBox.information(self, "Busy", "Ingest already running — wait for it to finish.")
+            return
 
         lw = self._current_sd_list()
         selected_idxs: List[int] = []
@@ -2190,7 +2672,6 @@ class WardriveGUI(QWidget):
                 if idx is not None:
                     selected_idxs.append(int(idx))
 
-        # De-duplicate indexes (same file appears in multiple tabs)
         selected_idxs = sorted(set(selected_idxs))
         if not selected_idxs:
             QMessageBox.information(self, "Nothing Selected", "Select at least one file to attach.")
@@ -2198,49 +2679,133 @@ class WardriveGUI(QWidget):
 
         candidates = [self._sd_candidates[i] for i in selected_idxs]
         skip_dupes = self.chk_sd_skip_dupes.isChecked()
+        total_mb = sum(c.size for c in candidates) / (1024 * 1024)
 
-        self._log(f"=== SD INGEST ===")
-        self._log(f"Selected: {len(candidates)} file(s). Skip duplicates: {skip_dupes}")
+        self._log(
+            f"=== SD INGEST === {len(candidates)} file(s)  ({total_mb:.1f} MB)  skip_dupes={skip_dupes}",
+            "SCAN",
+        )
         job_id = self._new_job("SD Ingest", f"{len(candidates)} selected")
 
-        def cb(msg: str):
-            self._log(msg)
-            self._update_job(job_id, progress=msg)
+        # Disable button so user can't double-fire; switch to console tab
+        self.btn_sd_ingest.setEnabled(False)
+        self.btn_sd_ingest.setText("Attaching…")
+        try:
+            self.tabs.setCurrentWidget(self.tab_console)
+        except Exception:
+            pass
+
+        # Progress bar
+        try:
+            self.progress.setValue(0)
+            self.progress.setFormat("Ingest 0%")
+        except Exception:
+            pass
+
+        worker = IngestWorker(
+            project_dir=self.project_dir,
+            sd_root=self._sd_root,
+            candidates=candidates,
+            label="SD",
+            skip_duplicates=skip_dupes,
+        )
+        self._ingest_worker = worker
+        self._ingest_job_id = job_id
+        self._ingest_total = len(candidates)
+
+        worker.stage.connect(self._on_ingest_stage)
+        worker.progress.connect(self._on_ingest_progress)
+        worker.file_progress.connect(self._on_ingest_file_progress)
+        worker.done.connect(self._on_ingest_done)
+        worker.failed.connect(self._on_ingest_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        worker.start()
+
+    def _on_ingest_stage(self, msg: str):
+        lvl = "ERROR" if msg.startswith("ERROR") else "WARN" if "Duplicate" in msg else "DEBUG"
+        self._log(msg, lvl)
+        self._update_job(getattr(self, "_ingest_job_id", None), progress=msg)
+
+    def _on_ingest_progress(self, done: int, total: int):
+        if total > 0:
+            pct = int(done / total * 100)
+            try:
+                self.progress.setValue(pct)
+                # Only update format if no active per-file operation is being shown
+                if not getattr(self, "_ingest_file_active", False):
+                    self.progress.setFormat(f"Ingest {pct}%  ({done}/{total} files)")
+            except Exception:
+                pass
+
+    def _on_ingest_file_progress(self, filename: str, phase: str, bdone: int, btotal: int):
+        """Per-file byte-level progress for large files during hash or copy phase."""
+        try:
+            self._ingest_file_active = True
+            pct = int(bdone / btotal * 100) if btotal > 0 else 0
+            mb_done = bdone / (1024 * 1024)
+            mb_total = btotal / (1024 * 1024)
+            verb = "Hashing" if phase == "hash" else "Copying"
+            file_total = getattr(self, "_ingest_total", 0)
+            file_done  = getattr(self, "_ingest_worker", None)
+            # Get current file count from worker's internal counter (best effort)
+            n = getattr(file_done, "_done_count", 0) if file_done else 0
+            counter = f"  —  File {n}/{file_total}" if file_total else ""
+            label = f"{verb} {filename}  {pct}%  ({mb_done:.0f} MB / {mb_total:.0f} MB){counter}"
+            self.progress.setValue(pct)
+            self.progress.setFormat(label)
+            # Clear the per-file lock once done so overall progress takes back over
+            if bdone >= btotal:
+                self._ingest_file_active = False
+        except Exception:
+            self._ingest_file_active = False
+
+    def _on_ingest_done(self, stats: dict):
+        self._ingest_worker = None
+        self._ingest_file_active = False
+        candidates_count = getattr(self, "_ingest_total", stats.get("total", 0))
+        summary = (
+            f"Copied {stats['imported']} | "
+            f"Duplicates {stats['duplicates']} | "
+            f"Errors {stats['errors']}  "
+            f"(of {candidates_count} selected)"
+        )
+        lvl = "ERROR" if stats["errors"] else "OK"
+        self._log(f"=== INGEST COMPLETE === {summary}", lvl)
+        if stats["errors"]:
+            self._log_warn("Some files failed to copy — check console for details.")
 
         try:
-            stats = ingest_candidates_to_project(
-                project_dir=self.project_dir,
-                sd_root=self._sd_root,
-                candidates=candidates,
-                label="SD",
-                skip_duplicates=skip_dupes,
-                progress_cb=cb,
-            )
-        except Exception as e:
-            self._update_job(job_id, status="Failed", ended=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), result=str(e))
-            QMessageBox.critical(self, "Ingest Error", str(e))
-            return
+            self.lbl_sd_stats.setText(summary)
+        except Exception:
+            pass
+        try:
+            self.progress.setValue(100)
+            self.progress.setFormat("Ingest complete")
+        except Exception:
+            pass
 
-        self.lbl_sd_stats.setText(
-            f"Attached {len(candidates)} selected | Copied {stats['imported']} | Duplicates {stats['duplicates']} | Errors {stats['errors']}"
-        )
+        self.btn_sd_ingest.setEnabled(True)
+        self.btn_sd_ingest.setText("Attach Selected to Project")
+
+        job_id = getattr(self, "_ingest_job_id", None)
         self._update_job(
             job_id,
             status="Complete" if stats["errors"] == 0 else "Complete with errors",
             ended=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            progress=self.lbl_sd_stats.text(),
+            progress=summary,
             result=self.project_dir,
         )
-        QMessageBox.information(self, "Ingest Complete", self.lbl_sd_stats.text())
-        self._log(self.lbl_sd_stats.text())
         self.refresh_mission_control()
+        QMessageBox.information(self, "Ingest Complete", summary)
 
-        # Immediately offer to analyze after ingest (fast workflow).
         try:
             resp = QMessageBox.question(
                 self,
                 "Analyze Now?",
-                "Evidence has been attached to this project.\n\nAnalyze now and generate reports?",
+                "Evidence attached.\n\nAnalyze now and generate reports?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes,
             )
@@ -2248,6 +2813,26 @@ class WardriveGUI(QWidget):
                 self.sd_analyze_project_evidence()
         except Exception:
             pass
+
+    def _on_ingest_failed(self, err: str):
+        self._ingest_worker = None
+        self._ingest_file_active = False
+        self._log_err(f"Ingest failed: {err}")
+        self.btn_sd_ingest.setEnabled(True)
+        self.btn_sd_ingest.setText("Attach Selected to Project")
+        try:
+            self.progress.setValue(0)
+            self.progress.setFormat("Ingest failed")
+        except Exception:
+            pass
+        job_id = getattr(self, "_ingest_job_id", None)
+        self._update_job(
+            job_id,
+            status="Failed",
+            ended=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            result=err,
+        )
+        QMessageBox.critical(self, "Ingest Error", err)
 
 
     def sd_analyze_selected_now(self):
@@ -2325,41 +2910,6 @@ class WardriveGUI(QWidget):
         if not logs and not pcaps and not structured:
             QMessageBox.information(self, "No Supported Evidence", "No supported evidence was detected in your selection. (Try Select Recommended.)")
             return
-
-        # NEW vs ALREADY SEEN detection (project DB sha256)
-        already = None
-        new = None
-        try:
-            dbp = os.path.join(self.project_dir, "project.db")
-            if os.path.exists(dbp):
-                already = 0
-                new = 0
-                # only hash selected evidence types (pcaps can be large, but this is the most accurate check)
-                for p in (pcaps + logs + structured):
-                    try:
-                        sha = sha256_file(p)
-                        if sha256_exists(dbp, sha):
-                            already += 1
-                        else:
-                            new += 1
-                    except Exception:
-                        pass
-                self._log(f"Project evidence match (by hash): already ingested {already} | new to project {new}")
-        except Exception:
-            pass
-
-        # Allow re-analysis even if everything was already seen, but confirm first.
-        if already is not None and new is not None and already > 0 and new == 0:
-            resp = QMessageBox.question(
-                self,
-                "Analyze Anyway?",
-                "All selected evidence appears to have been ingested into this project already (hash match).\n\nAnalyze anyway and generate a fresh run folder?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if resp != QMessageBox.Yes:
-                self._log("Analyze cancelled (operator declined re-analysis of already-seen evidence).")
-                return
 
         # Feed analysis engine
         self.wardrive_files = logs + structured
