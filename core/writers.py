@@ -140,6 +140,79 @@ def ssid_display(ssid_raw: str) -> str:
         return f"ASCII: {s}"
 
 
+def _to_int(value, default: int = 0) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _top_repeated_rows(centroids: List[dict], limit: int = 25) -> List[Tuple]:
+    repeated = [
+        c for c in centroids
+        if _to_int(c.get("Sightings")) > 1 or c.get("RepeatedAcrossFiles") == "Yes" or c.get("MultiDaySeen") == "Yes"
+    ]
+    repeated.sort(
+        key=lambda c: (
+            _to_int(c.get("ActiveDays")),
+            _to_int(c.get("SourceFileCount")),
+            _to_int(c.get("Sightings")),
+            _to_int(c.get("Stability")),
+        ),
+        reverse=True,
+    )
+    rows = []
+    for c in repeated[:limit]:
+        rows.append((
+            c.get("MAC", NO_DATA),
+            c.get("TopSSID", NO_DATA),
+            c.get("Sightings", NO_DATA),
+            c.get("UsedForCentroid", NO_DATA),
+            c.get("ActiveDays", NO_DATA),
+            c.get("SourceFileCount", NO_DATA),
+            c.get("MultiDaySeen", NO_DATA),
+            c.get("ConfidenceRadiusM", NO_DATA),
+            c.get("LocationQuality", NO_DATA),
+            c.get("FirstSeen", NO_DATA),
+            c.get("LastSeen", NO_DATA),
+        ))
+    return rows
+
+
+def _best_location_rows(centroids: List[dict], limit: int = 25) -> List[Tuple]:
+    located = [c for c in centroids if c.get("CentroidLat") not in (NO_DATA, "", None)]
+    located.sort(
+        key=lambda c: (
+            {"High": 3, "Medium": 2, "Low": 1}.get(str(c.get("LocationQuality")), 0),
+            _to_int(c.get("Stability")),
+            -_to_float(c.get("ConfidenceRadiusM"), 999999.0),
+            _to_int(c.get("UsedForCentroid")),
+        ),
+        reverse=True,
+    )
+    rows = []
+    for c in located[:limit]:
+        rows.append((
+            c.get("MAC", NO_DATA),
+            c.get("TopSSID", NO_DATA),
+            c.get("LocationQuality", NO_DATA),
+            c.get("Stability", NO_DATA),
+            c.get("ConfidenceRadiusM", NO_DATA),
+            c.get("UsedForCentroid", NO_DATA),
+            c.get("Sightings", NO_DATA),
+            c.get("CentroidLat", NO_DATA),
+            c.get("CentroidLon", NO_DATA),
+        ))
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # CSV / XLSX
 # ---------------------------------------------------------------------------
@@ -213,7 +286,10 @@ def write_kml(centroids: List[dict], outdir: str) -> str:
             f"MAC: {escape(c['MAC'])}<br>"
             f"Security: {escape(c.get('AuthMode', NO_DATA))}<br>"
             f"Obs: {escape(str(c.get('Sightings', NO_DATA)))}<br>"
+            f"Used for centroid: {escape(str(c.get('UsedForCentroid', NO_DATA)))}<br>"
+            f"Active days: {escape(str(c.get('ActiveDays', NO_DATA)))}<br>"
             f"Confidence (m): {escape(str(c.get('ConfidenceRadiusM', NO_DATA)))}<br>"
+            f"Location quality: {escape(str(c.get('LocationQuality', NO_DATA)))}<br>"
             f"Seen in PCAP: {escape(c.get('SeenInPCAP', NO_DATA))}"
         )
         placemarks.append(
@@ -323,8 +399,14 @@ def write_map_html(
             f"MAC: {escape(c['MAC'])}<br>"
             f"Security: {escape(c.get('AuthMode', NO_DATA))}<br>"
             f"Obs: {escape(str(c.get('Sightings', NO_DATA)))}<br>"
+            f"Used for centroid: {escape(str(c.get('UsedForCentroid', NO_DATA)))}<br>"
+            f"Active days: {escape(str(c.get('ActiveDays', NO_DATA)))}<br>"
+            f"Source files: {escape(str(c.get('SourceFileCount', NO_DATA)))}<br>"
             f"Confidence (m): {escape(str(c.get('ConfidenceRadiusM', NO_DATA)))}<br>"
             f"Stability: {escape(str(c.get('Stability', NO_DATA)))}<br>"
+            f"Location quality: {escape(str(c.get('LocationQuality', NO_DATA)))}<br>"
+            f"First seen: {escape(str(c.get('FirstSeen', NO_DATA)))}<br>"
+            f"Last seen: {escape(str(c.get('LastSeen', NO_DATA)))}<br>"
             f"Risk: {escape(str(c.get('RiskScore', NO_DATA)))}<br>"
             f"Seen in PCAP: {escape(c.get('SeenInPCAP', NO_DATA))}"
         )
@@ -580,11 +662,17 @@ def write_summary_html(centroids: List[dict], outdir: str, pcap_status: str, sta
         ("PCAP Parser", pcap_status),
         ("Networks with GPS Centroids", stats["centroid_with_loc"]),
         ("Total Raw Sightings", stats["raw_sightings"]),
+        ("APs Seen More Than Once", stats.get("repeat_aps", 0)),
+        ("APs Seen Across Multiple Files", stats.get("multi_file_aps", 0)),
+        ("APs Seen Across Multiple Days", stats.get("multi_day_aps", 0)),
+        ("High/Medium Location Quality", f"{stats.get('high_quality_locations', 0)} high / {stats.get('medium_quality_locations', 0)} medium"),
         ("PCAP ↔ Log Overlap", stats["overlap_text"]),
         ("Avg Sightings / MAC", stats["avg_sightings"]),
         ("RSSI Range (dBm)", stats["rssi_range"]),
         ("GPS Bounds", stats["bounds_str"]),
     ]
+    repeated_rows = _top_repeated_rows(centroids)
+    located_rows = _best_location_rows(centroids)
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>Wardrive Analysis Summary</title>
 <style>
@@ -594,6 +682,7 @@ def write_summary_html(centroids: List[dict], outdir: str, pcap_status: str, sta
   th,td{{border:1px solid limegreen;padding:8px;text-align:left}}
   a{{color:cyan;text-decoration:none}} a:hover{{text-decoration:underline}}
   .notes{{font-style:italic;color:#A0FFA0}}
+  .callout{{border:1px solid #00ffcc;padding:12px;margin:14px 0;color:#c8fff0;background:#001715}}
 </style></head><body>
 <h1>WARDRIVE ANALYSIS SUMMARY</h1>
 <p>Generated: {escape(now_str())}</p>
@@ -604,15 +693,25 @@ def write_summary_html(centroids: List[dict], outdir: str, pcap_status: str, sta
   <a href="wardrive_map.kml">KML</a> |
   <a href="pcap_summary.html">PCAP Evidence</a>
 </div>
+<div class="callout">
+  <b>Location refinement:</b> repeated sightings are now carried through the master CSV, KML, map popups, and this report.
+  When the same AP is observed across multiple passes or days, the centroid uses RSSI/GPS-accuracy weighting and the report marks the location quality.
+</div>
 <h2>Overall Statistics</h2>
 {_html_table(["Metric","Value"], overall)}
+<h2>Repeated APs / Triangulation Candidates</h2>
+{_html_table(["MAC","SSID","Sightings","UsedForCentroid","ActiveDays","SourceFiles","MultiDay","ConfidenceM","LocationQuality","FirstSeen","LastSeen"], repeated_rows) if repeated_rows else "<p>No repeated AP sightings were found in this run.</p>"}
+<h2>Best Located APs</h2>
+{_html_table(["MAC","SSID","LocationQuality","Stability","ConfidenceM","UsedForCentroid","Sightings","Lat","Lon"], located_rows) if located_rows else "<p>No APs with GPS centroids were found in this run.</p>"}
 <h2>How to read this</h2>
 <ul>
   <li><b>PCAP data</b> = radio evidence that a Wi-Fi network was on-air.</li>
   <li><b>Log data</b> = GPS evidence of where you were when you saw it.</li>
   <li><b>Overlap</b> = same BSSID in both sources — highest confidence.</li>
-  <li><b>Centroid</b> = weighted best-guess location of the AP.</li>
+  <li><b>Centroid</b> = weighted best-guess location of the AP using stronger RSSI and better GPS accuracy more heavily.</li>
   <li><b>Confidence circle</b> = uncertainty radius. Bigger = less certain.</li>
+  <li><b>Active days</b> and <b>source files</b> show whether the same AP was repeatedly observed across the SD-card collection.</li>
+  <li><b>Location quality</b> is High/Medium/Low/No GPS fix based on confidence radius and repeated usable GPS observations.</li>
   <li>The <b>Map</b> includes a signal heatmap and your drive route — toggle layers top-right.</li>
 </ul>
 <h2>Reports</h2>

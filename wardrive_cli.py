@@ -33,6 +33,30 @@ def _cmd_latest_run(args: argparse.Namespace) -> dict[str, Any]:
     return svc.latest_run(args.project)
 
 
+def _cmd_summarize_latest_run(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.summarize_latest_run(args.project, top_limit=args.top)
+
+
+def _cmd_strongest_unknown_aps(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.strongest_unknown_aps(args.project, limit=args.limit)
+
+
+def _cmd_compare_latest_runs(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.compare_latest_runs(args.project)
+
+
+def _cmd_suspicious_handshakes(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.suspicious_handshakes(args.project, limit=args.limit)
+
+
+def _cmd_evidence_health(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.evidence_health(args.project)
+
+
+def _cmd_integration_plan(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.integration_plan()
+
+
 def _cmd_scan_folder(args: argparse.Namespace) -> dict[str, Any]:
     return svc.scan_folder(args.folder, limit=args.limit, include_hidden=args.include_hidden)
 
@@ -54,6 +78,18 @@ def _dispatch_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
         return svc.runs_list(str(params["project"]), limit=int(params.get("limit", 20)))
     if action == "latest_run":
         return svc.latest_run(str(params["project"]))
+    if action == "summarize_latest_run":
+        return svc.summarize_latest_run(str(params["project"]), top_limit=int(params.get("top", 10)))
+    if action == "strongest_unknown_aps":
+        return svc.strongest_unknown_aps(str(params["project"]), limit=int(params.get("limit", 25)))
+    if action == "compare_latest_runs":
+        return svc.compare_latest_runs(str(params["project"]))
+    if action == "suspicious_handshakes":
+        return svc.suspicious_handshakes(str(params["project"]), limit=int(params.get("limit", 25)))
+    if action == "evidence_health":
+        return svc.evidence_health(str(params["project"]))
+    if action == "integration_plan":
+        return svc.integration_plan()
     if action == "scan_folder":
         return svc.scan_folder(str(params["folder"]), limit=int(params.get("limit", 250)), include_hidden=bool(params.get("include_hidden", False)))
     if action == "analyze_project":
@@ -112,6 +148,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("project")
     p.set_defaults(func=_cmd_latest_run)
+
+    p = sub.add_parser("summarize-latest-run", help="Summarize risk, auth, and changes for the latest run.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("project")
+    p.add_argument("--top", type=int, default=10, help="Number of top-risk APs to return.")
+    p.set_defaults(func=_cmd_summarize_latest_run)
+
+    p = sub.add_parser("strongest-unknown-aps", help="Find strongest hidden, unknown, or incomplete AP records.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("project")
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=_cmd_strongest_unknown_aps)
+
+    p = sub.add_parser("compare-latest-runs", help="Compare the two newest wardrive master CSVs.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("project")
+    p.set_defaults(func=_cmd_compare_latest_runs)
+
+    p = sub.add_parser("suspicious-handshakes", help="Flag APs with handshake or EAPOL evidence.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("project")
+    p.add_argument("--limit", type=int, default=25)
+    p.set_defaults(func=_cmd_suspicious_handshakes)
+
+    p = sub.add_parser("evidence-health", help="Report duplicate evidence, missing sources, and empty PCAP summaries.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("project")
+    p.set_defaults(func=_cmd_evidence_health)
+
+    p = sub.add_parser("integration-plan", help="List planned import, map, WiGLE, and agent bridge surfaces.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=_cmd_integration_plan)
 
     p = sub.add_parser("scan-folder", help="Scan an SD/evidence folder without ingesting.")
     p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
