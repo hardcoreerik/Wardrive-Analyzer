@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .constants import NO_DATA, CORE_REVISION
@@ -33,6 +34,46 @@ def _emit_checklist(cb: Optional[Callable[[str], None]], run_dir: str, expected:
         mark = "[OK]" if os.path.exists(p) else "[MISSING]"
         _emit(cb, f"{mark} {rel}")
     _emit(cb, "=== End Checklist ===")
+
+
+def _sighting_day(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if "T" in text and len(text) >= 10:
+        return text[:10]
+    if " " in text and len(text) >= 10:
+        prefix = text[:10]
+        if prefix.count("-") == 2 or prefix.count("/") == 2:
+            return prefix
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return text[:10] if len(text) >= 10 else text
+
+
+def _sort_seen_values(values: List[str]) -> List[str]:
+    def key(value: str) -> tuple[int, str]:
+        text = (value or "").strip()
+        if not text:
+            return (1, "")
+        return (0, text)
+
+    return sorted(values, key=key)
+
+
+def _location_quality(conf_m: Optional[float], used_n: int, active_days: int) -> str:
+    if conf_m is None or used_n <= 0:
+        return "No GPS fix"
+    if used_n >= 8 and conf_m <= 25:
+        return "High"
+    if used_n >= 4 and conf_m <= 75:
+        return "Medium"
+    if active_days >= 2 and used_n >= 3 and conf_m <= 150:
+        return "Medium"
+    return "Low"
 
 
 def analyze(
@@ -90,7 +131,15 @@ def analyze(
         if clat is not None and clon is not None:
             centroid_points.append((clat, clon))
 
+        seen_values = _sort_seen_values([s.first_seen for s in sights if s.first_seen])
+        first_seen = seen_values[0] if seen_values else NO_DATA
+        last_seen = seen_values[-1] if seen_values else NO_DATA
+        active_days_set = {_sighting_day(s.first_seen) for s in sights if _sighting_day(s.first_seen)}
+        source_files = sorted(logfiles_by_mac.get(mac, set()))
+        active_day_count = len(active_days_set)
+        source_file_count = len(source_files)
         stab = stability_score(conf_m, used_n or 0) if conf_m is not None else 0
+        quality = _location_quality(conf_m, used_n or 0, active_day_count)
         eapol_f = int(eapol_by_bssid.get(mac, 0)) if isinstance(eapol_by_bssid, dict) else 0
         hs_conf = handshake_conf.get(mac, "EAPOL" if eapol_f > 0 else "NONE") if isinstance(handshake_conf, dict) else "NONE"
         risk = compute_risk(auth_mode, top_ssid, best_rssi)
@@ -107,16 +156,23 @@ def analyze(
             "HandshakePCAPFiles": ", ".join(sorted(pcaps_by_ap.get(mac, set()))) if eapol_f > 0 else NO_DATA,
             "Sightings": len(sights),
             "UsedForCentroid": used_n or 0,
+            "FirstSeen": first_seen,
+            "LastSeen": last_seen,
+            "ActiveDays": active_day_count,
+            "SourceFileCount": source_file_count,
+            "RepeatedAcrossFiles": "Yes" if source_file_count > 1 else "No",
+            "MultiDaySeen": "Yes" if active_day_count > 1 else "No",
             "BestRSSI": best_rssi if best_rssi is not None else NO_DATA,
             "AvgRSSI": avg_rssi if avg_rssi is not None else NO_DATA,
             "CentroidLat": round(clat, 7) if clat is not None else NO_DATA,
             "CentroidLon": round(clon, 7) if clon is not None else NO_DATA,
             "ConfidenceRadiusM": round(conf_m, 1) if conf_m is not None else NO_DATA,
             "Stability": stab,
+            "LocationQuality": quality,
             "RiskScore": risk,
             "SeenInPCAP": "Yes" if mac in ap_bssids else "No",
             "PCAPFiles": ", ".join(sorted(pcaps_by_ap.get(mac, set()))) or NO_DATA,
-            "LogFiles": ", ".join(sorted(logfiles_by_mac.get(mac, set()))) or NO_DATA,
+            "LogFiles": ", ".join(source_files) or NO_DATA,
         })
 
     centroids.sort(key=lambda r: (r.get("RiskScore", 0), r.get("Sightings", 0)), reverse=True)
@@ -146,6 +202,11 @@ def analyze(
         "log_unique": log_unique,
         "centroid_with_loc": sum(1 for r in centroids if r.get("CentroidLat") not in (NO_DATA, "", None)),
         "raw_sightings": raw_sightings,
+        "repeat_aps": sum(1 for r in centroids if int(r.get("Sightings") or 0) > 1),
+        "multi_file_aps": sum(1 for r in centroids if r.get("RepeatedAcrossFiles") == "Yes"),
+        "multi_day_aps": sum(1 for r in centroids if r.get("MultiDaySeen") == "Yes"),
+        "high_quality_locations": sum(1 for r in centroids if r.get("LocationQuality") == "High"),
+        "medium_quality_locations": sum(1 for r in centroids if r.get("LocationQuality") == "Medium"),
         "overlap_text": f"{overlap} ({overlap_pct}% of PCAP BSSIDs; {overlap_pct_logs}% of log MACs)",
         "avg_sightings": round(raw_sightings / log_unique, 2) if log_unique else 0,
         "rssi_range": rssi_range,

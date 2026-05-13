@@ -12,7 +12,7 @@ ACC_DEFAULT_M = 25.0
 DROP_WEAKEST_FRAC = 0.10
 
 # KML
-KML_CIRCLE_POINTS = 36
+KML_CIRCLE_POINTS = 12
 
 # Leaflet assets (bundled locally; fallback CDN only if local missing)
 LEAFLET_CSS_LOCAL = "leaflet/leaflet.css"

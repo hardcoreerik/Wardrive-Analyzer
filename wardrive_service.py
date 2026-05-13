@@ -15,6 +15,14 @@ from project_vault import (
     list_project_evidence_detailed,
     scan_sd_folder,
 )
+from report_intel import (
+    compare_latest_runs as build_compare_latest_runs,
+    evidence_health as build_evidence_health,
+    planned_integration_surface,
+    strongest_unknown_aps as build_strongest_unknown_aps,
+    summarize_latest_run as build_summarize_latest_run,
+    suspicious_handshakes as build_suspicious_handshakes,
+)
 
 
 def _jsonable(value: Any) -> Any:
@@ -88,6 +96,43 @@ def latest_run(project_dir: str) -> dict[str, Any]:
         project_dir=os.path.abspath(project_dir),
         latest_run=runs[0] if runs else None,
     )
+
+
+def summarize_latest_run(project_dir: str, top_limit: int = 10) -> dict[str, Any]:
+    data = build_summarize_latest_run(project_dir, top_limit=top_limit)
+    if data.get("error"):
+        return result("error", **data)
+    return result("ok", **data)
+
+
+def strongest_unknown_aps(project_dir: str, limit: int = 25) -> dict[str, Any]:
+    data = build_strongest_unknown_aps(project_dir, limit=limit)
+    if data.get("error"):
+        return result("error", **data)
+    return result("ok", **data)
+
+
+def compare_latest_runs(project_dir: str) -> dict[str, Any]:
+    data = build_compare_latest_runs(project_dir)
+    if data.get("error"):
+        return result("error", **data)
+    return result("ok", **data)
+
+
+def suspicious_handshakes(project_dir: str, limit: int = 25) -> dict[str, Any]:
+    data = build_suspicious_handshakes(project_dir, limit=limit)
+    if data.get("error"):
+        return result("error", **data)
+    return result("ok", **data)
+
+
+def evidence_health(project_dir: str) -> dict[str, Any]:
+    data = build_evidence_health(project_dir)
+    return result("ok", **data)
+
+
+def integration_plan() -> dict[str, Any]:
+    return result("ok", **planned_integration_surface())
 
 
 def scan_folder(folder: str, limit: int = 250, include_hidden: bool = False) -> dict[str, Any]:
