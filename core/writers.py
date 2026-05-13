@@ -608,40 +608,98 @@ def write_pcap_reports(
                 r["AP_MatchPct"], r["Station_Frames"], r["Station_UniqueMACs"],
                 r.get("HandshakePresent","No"), r.get("EAPOL_Frames",0)) for r in per_rows]
 
+    total_ap_frames = sum(int(r.get("Frames", 0) or 0) for r in master_rows)
+    total_eapol = sum(int(r.get("EAPOLFrames", 0) or 0) for r in master_rows)
+    handshake_count = sum(1 for r in master_rows if r.get("HandshakeSeen") == "Yes")
+    matched_count = sum(1 for r in master_rows if r.get("MatchedInLogs") == "Yes")
+    top_handshakes = [
+        (
+            r.get("BSSID", NO_DATA),
+            ssid_display((ssid_counts_by_bssid.get(r.get("BSSID", ""), Counter()).most_common(1) or [("", 0)])[0][0]),
+            r.get("HandshakeConfidence", NO_DATA),
+            r.get("EAPOLFrames", 0),
+            r.get("HandshakePCAPFiles", NO_DATA),
+        )
+        for r in master_rows
+        if r.get("HandshakeSeen") == "Yes" or int(r.get("EAPOLFrames", 0) or 0) > 0
+    ][:50]
+    metric_cards = "".join(
+        f'<div class="metric"><span>{escape(label)}</span><b>{escape(str(value))}</b></div>'
+        for label, value in [
+            ("AP BSSIDs", len(master_rows)),
+            ("AP Frames", total_ap_frames),
+            ("Log Matches", matched_count),
+            ("Handshake APs", handshake_count),
+            ("EAPOL Frames", total_eapol),
+            ("PCAP Files", len(per_rows)),
+        ]
+    )
+
     html_path = os.path.join(outdir, "pcap_summary.html")
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>PCAP Evidence Report</title>
 <style>
-  body{{background:black;color:limegreen;font-family:Consolas,monospace;padding:20px}}
-  h1,h2{{color:#00ffcc;text-shadow:0 0 6px #00ffcc}}
-  table{{border-collapse:collapse;width:100%;margin:12px 0}}
-  th,td{{border:1px solid limegreen;padding:6px;vertical-align:top}}
-  a{{color:cyan;text-decoration:none}} a:hover{{text-decoration:underline}}
-  .notes{{color:#A0FFA0;font-style:italic}}
+  :root{{--bg:#050607;--panel:#07110d;--panel2:#081b14;--fg:#d7fff4;--muted:#6f9188;--accent:#00ffcc;--ok:#50ff90;--warn:#ffd080;--bad:#ff5555;--line:#163b32}}
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:var(--bg);color:var(--fg);font-family:Consolas,monospace;padding:18px;line-height:1.45}}
+  h1{{margin:0;color:var(--accent);font-size:24px;letter-spacing:0;text-shadow:0 0 8px rgba(0,255,204,.45)}}
+  h2{{color:var(--accent);font-size:15px;margin:20px 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}}
+  a{{color:#7cf7ff;text-decoration:none}} a:hover{{text-decoration:underline}}
+  .nav{{position:sticky;top:0;z-index:3;display:flex;gap:8px;flex-wrap:wrap;background:rgba(5,6,7,.92);padding:8px 0 12px;margin-bottom:6px;border-bottom:1px solid var(--line)}}
+  .nav a{{border:1px solid #1f6e64;border-radius:4px;padding:4px 10px;color:#99fff0}}
+  .hero{{background:linear-gradient(135deg,rgba(0,255,204,.10),rgba(80,255,144,.04));border:1px solid var(--line);border-radius:6px;padding:14px;margin-bottom:12px}}
+  .sub{{color:var(--muted);font-size:12px;margin-top:4px}}
+  .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:12px 0}}
+  .metric{{border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:10px}}
+  .metric span{{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}}
+  .metric b{{display:block;color:var(--ok);font-size:19px;margin-top:3px}}
+  .card{{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px;margin:12px 0;overflow:auto}}
+  table{{border-collapse:collapse;width:100%;margin:8px 0;font-size:12px}}
+  th{{position:sticky;top:45px;background:#0a2119;color:#9dfff0;text-align:left;border-bottom:1px solid var(--line);padding:7px;white-space:nowrap}}
+  td{{border-bottom:1px solid #0d241d;padding:6px 7px;vertical-align:top}}
+  tr:hover td{{background:rgba(0,255,204,.045)}}
+  .notes{{color:var(--muted);font-style:italic;font-size:12px}}
+  .meaning{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}}
+  .meaning div{{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:10px}}
+  code{{color:#9dfff0}}
 </style></head><body>
-<div style="padding:10px;border:1px solid limegreen;margin-bottom:12px">
-  <b>Navigate:</b>
+<div class="nav">
   <a href="summary.html">Summary</a> |
   <a href="map.html">Map</a> |
-  <a href="pcap_summary.html">PCAP Evidence</a>
+  <a href="pcap_summary.html">PCAP Evidence</a> |
+  <a href="pcap_bssid_master.csv">BSSID CSV</a> |
+  <a href="pcap_per_file_summary.csv">Per-File CSV</a>
 </div>
-<h1>PCAP Evidence Report</h1>
-<p><b>Parser:</b> {escape(status)} | Generated: {escape(now_str())}</p>
-<p><b>OUI DB:</b> {oui_entries} entries — {escape(oui_src)}</p>
-<h2>What this means</h2>
-<ul>
-  <li><b>AP section</b>: beacons + probe-responses → strong evidence a network was on-air.</li>
-  <li><b>Stations</b>: probe/assoc requests → nearby clients searching or joining.</li>
-  <li><b>Handshake 4WAY</b> = all 4 EAPOL messages seen. PARTIAL = some. EAPOL = frames present.</li>
-</ul>
-<h2>Per-PCAP Summary</h2>
-{_html_table(["PCAP","AP_Frames","AP_BSSIDs","AP_LogMatch","AP_MatchPct","STA_Frames","STA_MACs","Handshake","EAPOL"],per_tbl)}
-<h2>Top 50 Access Points by Frames</h2>
-{_html_table(["BSSID","SSID","Frames","InLogs","Handshake","HS_Conf","EAPOL","Ch","BestRSSI","Vendor","Category"],ap_tbl)}
-<h2>Top 50 Stations by Frames</h2>
-{_html_table(["StationMAC","Frames","Ch","BestRSSI","Vendor","LocalAdmin?","Category"],sta_tbl)}
-<p class="notes">LocalAdmin=Yes → MAC is randomized; vendor and device guesses are unreliable.</p>
-<p class="notes">Parser: {escape(status)}</p>
+<section class="hero">
+  <h1>PCAP Evidence Report</h1>
+  <div class="sub">Generated {escape(now_str())} | Parser: {escape(status)} | OUI DB: {oui_entries} entries - {escape(oui_src)}</div>
+</section>
+<section class="metrics">{metric_cards}</section>
+<section class="card">
+  <h2>What This Means</h2>
+  <div class="meaning">
+    <div><b>Access Points</b><br/>Beacon and probe-response frames are strong evidence a network was on-air.</div>
+    <div><b>Stations</b><br/>Probe and association frames identify nearby wireless clients and randomized devices.</div>
+    <div><b>Handshakes</b><br/>4WAY means all four EAPOL messages were seen. PARTIAL means incomplete but useful evidence. EAPOL means frames were present.</div>
+  </div>
+</section>
+<section class="card" id="handshakes">
+  <h2>Handshake Spotlight</h2>
+  {_html_table(["BSSID","SSID","Confidence","EAPOL","Source PCAPs"], top_handshakes) if top_handshakes else '<p class="notes">No handshake or EAPOL APs were flagged in this run.</p>'}
+</section>
+<section class="card">
+  <h2>Per-PCAP Summary</h2>
+  {_html_table(["PCAP","AP_Frames","AP_BSSIDs","AP_LogMatch","AP_MatchPct","STA_Frames","STA_MACs","Handshake","EAPOL"],per_tbl)}
+</section>
+<section class="card">
+  <h2>Top 50 Access Points By Frames</h2>
+  {_html_table(["BSSID","SSID","Frames","InLogs","Handshake","HS_Conf","EAPOL","Ch","BestRSSI","Vendor","Category"],ap_tbl)}
+</section>
+<section class="card">
+  <h2>Top 50 Stations By Frames</h2>
+  {_html_table(["StationMAC","Frames","Ch","BestRSSI","Vendor","LocalAdmin?","Category"],sta_tbl)}
+  <p class="notes">LocalAdmin=Yes means the MAC is randomized; vendor and device guesses are unreliable.</p>
+</section>
 </body></html>
 """
     with open(html_path, "w", encoding="utf-8") as f:

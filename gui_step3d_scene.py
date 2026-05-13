@@ -21,6 +21,13 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView
 )
 
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    WEBENGINE_AVAILABLE = True
+except Exception:
+    QWebEngineView = None  # type: ignore[assignment]
+    WEBENGINE_AVAILABLE = False
+
 # -----------------------------
 # Asset helpers
 # -----------------------------
@@ -1172,7 +1179,7 @@ class WardriveGUI(QWidget):
         self.lbl_latest.setObjectName("PathLabel")
         v.addWidget(self.lbl_latest)
 
-        self.chk_auto_open = QCheckBox("Auto-open run folder when complete")
+        self.chk_auto_open = QCheckBox("Auto-open latest summary in app when complete")
         self.chk_auto_open.setChecked(True)
         v.addWidget(self.chk_auto_open)
 
@@ -1181,7 +1188,7 @@ class WardriveGUI(QWidget):
         self.btn_open_run.clicked.connect(lambda: self._open_path(self._latest_run_dir) if self._latest_run_dir else None)
         self.btn_open_run.setEnabled(False)
 
-        self.btn_open_latest = QPushButton("Open Latest Summary")
+        self.btn_open_latest = QPushButton("View Latest Summary In App")
         self.btn_open_latest.clicked.connect(self.open_latest_summary)
         self.btn_open_latest.setEnabled(False)
 
@@ -1190,19 +1197,54 @@ class WardriveGUI(QWidget):
         v.addLayout(row)
 
         row2 = QHBoxLayout()
-        self.btn_open_latest_map = QPushButton("Open Latest Map")
-        self.btn_open_latest_map.clicked.connect(lambda: self._open_path(self._latest_output("map.html")))
+        self.btn_open_latest_map = QPushButton("View Map In App")
+        self.btn_open_latest_map.clicked.connect(lambda: self._view_report_in_app(self._latest_output("map.html"), "Map"))
         self.btn_open_latest_kml = QPushButton("Open Latest KML")
         self.btn_open_latest_kml.clicked.connect(lambda: self._open_path(self._latest_output("wardrive_map.kml")))
-        self.btn_open_latest_pcap = QPushButton("Open Latest PCAP Summary")
-        self.btn_open_latest_pcap.clicked.connect(lambda: self._open_path(self._latest_output("pcap_summary.html")))
+        self.btn_open_latest_pcap = QPushButton("View PCAP In App")
+        self.btn_open_latest_pcap.clicked.connect(lambda: self._view_report_in_app(self._latest_output("pcap_summary.html"), "PCAP Evidence"))
         row2.addWidget(self.btn_open_latest_map)
         row2.addWidget(self.btn_open_latest_kml)
         row2.addWidget(self.btn_open_latest_pcap)
         v.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        self.btn_open_summary_external = QPushButton("Open Summary Externally")
+        self.btn_open_summary_external.clicked.connect(lambda: self._open_path(self._latest_summary or self._project_last_summary))
+        self.btn_open_map_external = QPushButton("Open Map Externally")
+        self.btn_open_map_external.clicked.connect(lambda: self._open_path(self._latest_output("map.html")))
+        self.btn_open_pcap_external = QPushButton("Open PCAP Externally")
+        self.btn_open_pcap_external.clicked.connect(lambda: self._open_path(self._latest_output("pcap_summary.html")))
+        row3.addWidget(self.btn_open_summary_external)
+        row3.addWidget(self.btn_open_map_external)
+        row3.addWidget(self.btn_open_pcap_external)
+        v.addLayout(row3)
+
+        self.lbl_report_viewer = QLabel(
+            "Embedded report viewer: WebEngine active" if WEBENGINE_AVAILABLE
+            else "Embedded report viewer: WebEngine unavailable; external browser fallback is active"
+        )
+        self.lbl_report_viewer.setObjectName("Notes")
+        v.addWidget(self.lbl_report_viewer)
+
+        if WEBENGINE_AVAILABLE and QWebEngineView is not None:
+            self.report_viewer = QWebEngineView()
+            self.report_viewer.setMinimumHeight(430)
+            v.addWidget(self.report_viewer, 1)
+            self._set_report_placeholder("Select a generated report to preview it here.")
+        else:
+            self.report_viewer = QTextEdit()
+            self.report_viewer.setReadOnly(True)
+            self.report_viewer.setMinimumHeight(260)
+            self.report_viewer.setPlainText(
+                "PySide6 QtWebEngine is not installed in this runtime.\n\n"
+                "Reports are still generated normally and can be opened externally. "
+                "Install/ship PySide6-WebEngine to make Wardrive Analyzer fully self-contained for HTML report viewing."
+            )
+            v.addWidget(self.report_viewer, 1)
+
         hint = QLabel(
-            "Reports are generated locally inside each project run folder. Use Run History for older outputs."
+            "Reports are generated locally inside each project run folder. The in-app viewer keeps summary/map/PCAP review inside Mission Control."
         )
         hint.setObjectName("Notes")
         v.addWidget(hint)
@@ -1826,7 +1868,7 @@ class WardriveGUI(QWidget):
     def open_any_latest_summary(self) -> None:
         p = self._latest_summary or self._project_last_summary
         if p and os.path.exists(p):
-            self._open_path(p)
+            self._view_report_in_app(p, "Summary")
             return
         QMessageBox.information(self, "Latest Summary", "No summary.html found yet.")
 
@@ -1978,6 +2020,53 @@ class WardriveGUI(QWidget):
             except Exception:
                 pass
 
+    def _set_report_placeholder(self, message: str) -> None:
+        viewer = getattr(self, "report_viewer", None)
+        if viewer is None:
+            return
+        safe = (message or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        html = (
+            "<html><body style='background:#050607;color:#00ff88;"
+            "font-family:Consolas,monospace;padding:24px'>"
+            "<h2 style='color:#00ccff'>Wardrive Report Viewer</h2>"
+            f"<p>{safe}</p>"
+            "</body></html>"
+        )
+        try:
+            if WEBENGINE_AVAILABLE and QWebEngineView is not None and isinstance(viewer, QWebEngineView):
+                viewer.setHtml(html, QUrl.fromLocalFile(os.getcwd() + os.sep))
+            elif hasattr(viewer, "setHtml"):
+                viewer.setHtml(html)
+            elif hasattr(viewer, "setPlainText"):
+                viewer.setPlainText(message)
+        except Exception:
+            pass
+
+    def _view_report_in_app(self, path: str | None, title: str = "Report") -> None:
+        if not path:
+            return
+        if not os.path.exists(path):
+            QMessageBox.information(self, title, f"No report found:\n{path}")
+            return
+        viewer = getattr(self, "report_viewer", None)
+        if WEBENGINE_AVAILABLE and QWebEngineView is not None and isinstance(viewer, QWebEngineView):
+            try:
+                viewer.setUrl(QUrl.fromLocalFile(os.path.abspath(path)))
+                self.lbl_report_viewer.setText(f"Embedded report viewer: {title} - {os.path.abspath(path)}")
+                try:
+                    self.tabs.setCurrentWidget(self.tab_results)
+                except Exception:
+                    pass
+                self._log(f"In-app report loaded: {os.path.basename(path)}", "OK")
+                return
+            except Exception as exc:
+                self._log_warn(f"In-app report load failed, opening externally: {exc}")
+        else:
+            self._set_report_placeholder(
+                "QtWebEngine is unavailable in this runtime. Opening this report externally instead."
+            )
+        self._open_path(path)
+
     def _set_running(self, running: bool):
         # Track running state for re-entrancy guards and safe shutdown.
         # (This was previously checked but never set, allowing multiple concurrent runs.)
@@ -2120,7 +2209,7 @@ class WardriveGUI(QWidget):
     def open_last_summary(self):
         p = getattr(self, "_project_last_summary", None)
         if p and os.path.exists(p):
-            self._open_path(p)
+            self._view_report_in_app(p, "Summary")
             return
         QMessageBox.information(self, "Open Last Summary", "No prior summary.html found for this project yet.")
 
@@ -2413,7 +2502,7 @@ class WardriveGUI(QWidget):
         # Auto-open: prefer summary.html if available, else open the run folder
         if self.chk_auto_open.isChecked():
             if self._latest_summary and os.path.exists(self._latest_summary):
-                self._open_path(self._latest_summary)
+                self._view_report_in_app(self._latest_summary, "Summary")
             elif self._latest_run_dir and os.path.exists(self._latest_run_dir):
                 self._open_path(self._latest_run_dir)
 
@@ -2475,7 +2564,7 @@ class WardriveGUI(QWidget):
     def open_latest_summary(self):
         s = self._latest_summary or self._project_last_summary
         if s and os.path.exists(s):
-            self._open_path(s)
+            self._view_report_in_app(s, "Summary")
         else:
             QMessageBox.information(self, "Open Latest Summary", "No summary found yet for this session.")
 
