@@ -6,6 +6,7 @@ import platform
 import sys
 import threading
 import traceback
+import faulthandler
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -76,7 +77,40 @@ def write_error_report(
     return str(path)
 
 
+def write_diagnostic_snapshot(
+    title: str,
+    *,
+    context: Optional[dict[str, Any]] = None,
+    base_dir: Optional[str] = None,
+) -> str:
+    """Write/replace a small breadcrumb for the operation currently in flight."""
+    path = error_reports_dir(base_dir) / "latest_diagnostic_snapshot.json"
+    payload = {
+        "title": safe_text(title, 500),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "cwd": os.getcwd(),
+        "executable": sys.executable,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "thread": threading.current_thread().name,
+        "context": {str(k): safe_text(v, 3000) for k, v in (context or {}).items()},
+        "wardrive_run_log_tail": _tail_file(Path(os.getcwd()) / "wardrive_run.log"),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return str(path)
+
+
 def install_global_error_hooks(base_dir: Optional[str] = None) -> None:
+    reports = error_reports_dir(base_dir)
+    crash_path = reports / "python_faulthandler_crash.log"
+    try:
+        crash_file = crash_path.open("a", encoding="utf-8")
+        crash_file.write(f"\n\n=== faulthandler armed {datetime.now().isoformat(timespec='seconds')} ===\n")
+        crash_file.flush()
+        faulthandler.enable(file=crash_file, all_threads=True)
+    except Exception:
+        pass
+
     def excepthook(exc_type, exc, tb):
         report = write_error_report(
             "unhandled_exception",
@@ -88,6 +122,25 @@ def install_global_error_hooks(base_dir: Optional[str] = None) -> None:
         sys.__excepthook__(exc_type, exc, tb)
 
     sys.excepthook = excepthook
+
+    if hasattr(sys, "unraisablehook"):
+        def unraisable_hook(args):
+            exc = args.exc_value
+            report = write_error_report(
+                "unraisable_exception",
+                exc,
+                traceback_text="".join(traceback.format_exception(args.exc_type, exc, args.exc_traceback)),
+                context={
+                    "object": safe_text(getattr(args, "object", ""), 1000),
+                    "err_msg": safe_text(getattr(args, "err_msg", ""), 1000),
+                },
+                base_dir=base_dir,
+            )
+            print(f"Unraisable exception report: {report}", file=sys.stderr)
+            if getattr(sys, "__unraisablehook__", None):
+                sys.__unraisablehook__(args)
+
+        sys.unraisablehook = unraisable_hook
 
     if hasattr(threading, "excepthook"):
         def thread_hook(args):

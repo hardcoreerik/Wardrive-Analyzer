@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .helpers import norm_mac, is_locally_administered
+from .hardware_identity import parse_identity_ies
 
 try:
     import dpkt
@@ -153,6 +154,30 @@ def _parse_ssid_from_ie(payload: bytes) -> str:
     return "<HIDDEN>"
 
 
+def _useful_station_ssid(ssid: str) -> bool:
+    text = (ssid or "").strip()
+    if not text or text == "<HIDDEN>":
+        return False
+    if text.count("?") > max(2, len(text) // 3):
+        return False
+    if not any(ch.isalnum() for ch in text):
+        return False
+    return True
+
+
+def _plausible_unicast_mac(mac: str) -> bool:
+    try:
+        parts = (mac or "").split(":")
+        if len(parts) != 6:
+            return False
+        octets = [int(part, 16) for part in parts]
+    except Exception:
+        return False
+    if all(octet == 0x00 for octet in octets) or all(octet == 0xFF for octet in octets):
+        return False
+    return (octets[0] & 0x01) == 0
+
+
 def _mac_bytes_to_str(b: bytes) -> str:
     return ":".join(f"{x:02X}" for x in b)
 
@@ -170,6 +195,9 @@ class _PerFileResult:
         "rssi_best_ap",       # bssid -> int
         "ch_hits_sta",        # sta   -> {ch -> count}
         "rssi_best_sta",      # sta   -> int
+        "ssid_hits_sta",      # sta   -> {ssid -> count}
+        "bssid_hits_sta",     # sta   -> {bssid -> count}
+        "identity_hits",      # mac   -> RF Device DNA evidence counter
         "eapol_count",        # int
         "eapol_bssids",       # bssid -> count
         "eapol_msgs",         # bssid -> set of msg numbers
@@ -185,6 +213,9 @@ class _PerFileResult:
         self.rssi_best_ap: Dict[str, int] = {}
         self.ch_hits_sta: Dict[str, Counter] = defaultdict(Counter)
         self.rssi_best_sta: Dict[str, int] = {}
+        self.ssid_hits_sta: Dict[str, Counter] = defaultdict(Counter)
+        self.bssid_hits_sta: Dict[str, Counter] = defaultdict(Counter)
+        self.identity_hits: Dict[str, Counter] = defaultdict(Counter)
         self.eapol_count: int = 0
         self.eapol_bssids: Counter = Counter()
         self.eapol_msgs: Dict[str, set] = defaultdict(set)
@@ -272,10 +303,12 @@ def _process_mgmt(frame: bytes, subtype: int, rssi: Optional[int], ch: Optional[
             return
         r.ap_counts[bssid] += 1
         payload = frame[24:]
-        if subtype == _SUBTYPE_BEACON and len(payload) >= 12:
+        if subtype in (_SUBTYPE_BEACON, _SUBTYPE_PROBE_RESP) and len(payload) >= 12:
             payload = payload[12:]  # skip fixed fields (timestamp 8, interval 2, capability 2)
         ssid = _parse_ssid_from_ie(payload)
         r.ssid_hits[bssid][ssid] += 1
+        for token in parse_identity_ies(payload):
+            r.identity_hits[bssid][token] += 1
         if ch is not None:
             r.ch_hits_ap[bssid][str(ch)] += 1
         if rssi is not None:
@@ -287,6 +320,19 @@ def _process_mgmt(frame: bytes, subtype: int, rssi: Optional[int], ch: Optional[
         if not sta:
             return
         r.sta_counts[sta] += 1
+        payload = frame[24:]
+        if subtype == _SUBTYPE_ASSOC_REQ and len(payload) >= 4:
+            payload = payload[4:]
+        elif subtype == _SUBTYPE_REASSOC_REQ and len(payload) >= 10:
+            payload = payload[10:]
+        ssid = _parse_ssid_from_ie(payload)
+        if _useful_station_ssid(ssid):
+            r.ssid_hits_sta[sta][ssid] += 1
+        bssid = norm_mac(addr3)
+        if _plausible_unicast_mac(bssid):
+            r.bssid_hits_sta[sta][bssid] += 1
+        for token in parse_identity_ies(payload):
+            r.identity_hits[sta][token] += 1
         if ch is not None:
             r.ch_hits_sta[sta][str(ch)] += 1
         if rssi is not None:
@@ -366,6 +412,9 @@ def load_pcaps(
     Dict[str, int],
     Dict[str, Counter],
     Dict[str, int],
+    Dict[str, Counter],
+    Dict[str, Counter],
+    Dict[str, Counter],
     Dict[str, Set[str]],
     Dict[str, Set[str]],
     Dict[str, int],
@@ -376,10 +425,12 @@ def load_pcaps(
     """
     Parse all PCAP files in parallel using dpkt.
 
-    Returns the same 14-tuple as the legacy load_pcaps_tshark for drop-in compat:
+    Returns parser aggregates for APs, stations, handshakes, and station identity hints:
       ap_bssids, ap_per_pcap_counts, sta_per_pcap_counts,
       ssid_counts_by_bssid, ch_counts_by_ap, best_rssi_by_ap,
       ch_counts_by_sta, best_rssi_by_sta,
+      ssid_counts_by_sta, bssid_counts_by_sta,
+      identity_counts_by_mac,
       pcaps_by_ap, pcaps_by_sta,
       eapol_per_pcap, eapol_by_bssid, handshake_conf_by_bssid,
       status_string
@@ -387,7 +438,9 @@ def load_pcaps(
     if not _DPKT_OK:
         empty: Tuple = (
             set(), {}, {}, defaultdict(Counter), defaultdict(Counter), {},
-            defaultdict(Counter), {}, defaultdict(set), defaultdict(set),
+            defaultdict(Counter), {}, defaultdict(Counter), defaultdict(Counter),
+            defaultdict(Counter),
+            defaultdict(set), defaultdict(set),
             {}, {}, {}, "dpkt not installed — PCAP parsing skipped.",
         )
         return empty  # type: ignore[return-value]
@@ -400,6 +453,9 @@ def load_pcaps(
     rssi_ap: Dict[str, int] = {}
     ch_by_sta: Dict[str, Counter] = defaultdict(Counter)
     rssi_sta: Dict[str, int] = {}
+    ssid_by_sta: Dict[str, Counter] = defaultdict(Counter)
+    bssid_by_sta: Dict[str, Counter] = defaultdict(Counter)
+    identity_by_mac: Dict[str, Counter] = defaultdict(Counter)
     pcaps_by_ap: Dict[str, Set[str]] = defaultdict(set)
     pcaps_by_sta: Dict[str, Set[str]] = defaultdict(set)
     eapol_per_pcap: Dict[str, int] = {}
@@ -459,6 +515,12 @@ def load_pcaps(
                 for sta, rssi in res.rssi_best_sta.items():
                     if sta not in rssi_sta or rssi > rssi_sta[sta]:
                         rssi_sta[sta] = rssi
+                for sta, cnt in res.ssid_hits_sta.items():
+                    ssid_by_sta[sta].update(cnt)
+                for sta, cnt in res.bssid_hits_sta.items():
+                    bssid_by_sta[sta].update(cnt)
+                for mac, cnt in res.identity_hits.items():
+                    identity_by_mac[mac].update(cnt)
 
                 eapol_per_pcap[res.pcap_name] = res.eapol_count
                 for bssid, cnt in res.eapol_bssids.items():
@@ -488,6 +550,9 @@ def load_pcaps(
         rssi_ap,
         ch_by_sta,
         rssi_sta,
+        ssid_by_sta,
+        bssid_by_sta,
+        identity_by_mac,
         pcaps_by_ap,
         pcaps_by_sta,
         eapol_per_pcap,

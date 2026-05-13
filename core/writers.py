@@ -28,6 +28,7 @@ from .helpers import (
     now_str, oui_key, is_locally_administered, json_str, json_arr,
     resource_path,
 )
+from .hardware_identity import load_registry_db, summarize_identity
 from .parser_logs import Sighting
 
 _EXCEL_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
@@ -527,6 +528,9 @@ def write_pcap_reports(
     best_rssi_by_ap: Dict[str, int],
     ch_counts_by_sta: Dict[str, Counter],
     best_rssi_by_sta: Dict[str, int],
+    ssid_counts_by_sta: Dict[str, Counter],
+    bssid_counts_by_sta: Dict[str, Counter],
+    identity_counts_by_mac: Dict[str, Counter],
     pcaps_by_ap: Dict[str, Set[str]],
     pcaps_by_sta: Dict[str, Set[str]],
     eapol_per_pcap: Dict[str, int],
@@ -536,6 +540,7 @@ def write_pcap_reports(
     status: str,
 ) -> dict:
     oui_db, oui_src, oui_entries = load_oui_db()
+    registry_db, registry_src, registry_entries = load_registry_db()
 
     master_rows: List[dict] = []
     for bssid in sorted(ap_bssids):
@@ -544,6 +549,12 @@ def write_pcap_reports(
         frames = sum(c.get(bssid, 0) for c in ap_per_pcap_counts.values())
         eapol_frames = int(eapol_by_bssid.get(bssid, 0))
         hs_conf = handshake_conf_by_bssid.get(bssid, "EAPOL" if eapol_frames > 0 else "NONE")
+        identity = summarize_identity(
+            bssid,
+            "AP",
+            identity_counts_by_mac.get(bssid, Counter()),
+            registry_db,
+        )
         master_rows.append({
             "BSSID": bssid,
             "SSID(s)": ssids_csv,
@@ -554,6 +565,7 @@ def write_pcap_reports(
             "HandshakePCAPFiles": ", ".join(sorted(pcaps_by_ap.get(bssid, set()))) if eapol_frames > 0 else NO_DATA,
             "PCAPFiles": ", ".join(sorted(pcaps_by_ap.get(bssid, set()))) or NO_DATA,
             "MatchedInLogs": "Yes" if bssid in all_log_macs else "No",
+            **identity,
         })
     master_rows.sort(key=lambda r: int(r.get("Frames", 0)), reverse=True)
 
@@ -591,57 +603,168 @@ def write_pcap_reports(
         ap_tbl.append((b, ssid_display(best_ssid), r["Frames"], r["MatchedInLogs"],
                         r["HandshakeSeen"], r["HandshakeConfidence"], r["EAPOLFrames"],
                         ch, best_rssi_by_ap.get(b, NO_DATA), vendor,
+                        r.get("HardwareGuess", NO_DATA), r.get("HardwareConfidence", NO_DATA),
                         category_guess("AP", vendor, is_locally_administered(b))))
 
     sta_totals: Counter = Counter()
     for c in sta_per_pcap_counts.values():
         sta_totals.update(c)
+    station_rows: List[dict] = []
     sta_tbl = []
-    for sta, frames in sta_totals.most_common(50):
+    for sta, frames in sta_totals.most_common():
         ch = (ch_counts_by_sta.get(sta, Counter()).most_common(1) or [("", 0)])[0][0] or NO_DATA
         vendor = vendor_for(sta, oui_db)
         loc = "Yes" if is_locally_administered(sta) else "No"
-        sta_tbl.append((sta, frames, ch, best_rssi_by_sta.get(sta, NO_DATA), vendor, loc,
-                        category_guess("STA", vendor, is_locally_administered(sta))))
+        ssid_hits = ssid_counts_by_sta.get(sta, Counter())
+        bssid_hits = bssid_counts_by_sta.get(sta, Counter())
+        identity = summarize_identity(
+            sta,
+            "STA",
+            identity_counts_by_mac.get(sta, Counter()),
+            registry_db,
+        )
+        likely_ssid = (ssid_hits.most_common(1) or [(NO_DATA, 0)])[0][0] or NO_DATA
+        likely_bssid = (bssid_hits.most_common(1) or [(NO_DATA, 0)])[0][0] or NO_DATA
+        inference_parts = []
+        if likely_ssid != NO_DATA:
+            inference_parts.append("probe/assoc SSID")
+        if likely_bssid != NO_DATA:
+            inference_parts.append("assoc BSSID")
+        if loc == "Yes":
+            inference_parts.append("randomized MAC")
+        inference = ", ".join(inference_parts) or "client frame only"
+        row = {
+            "StationMAC": sta,
+            "LikelySSID": likely_ssid,
+            "LikelyBSSID": likely_bssid,
+            "Frames": frames,
+            "Ch": ch,
+            "BestRSSI": best_rssi_by_sta.get(sta, NO_DATA),
+            "Vendor": vendor,
+            "LocalAdmin": loc,
+            "Category": category_guess("STA", vendor, is_locally_administered(sta)),
+            **identity,
+            "Inference": inference,
+            "SourcePCAPs": ", ".join(sorted(pcaps_by_sta.get(sta, set()))) or NO_DATA,
+        }
+        station_rows.append(row)
+        if len(sta_tbl) < 50:
+            sta_tbl.append((
+                row["StationMAC"],
+                ssid_display(str(row["LikelySSID"])) if row["LikelySSID"] != NO_DATA else NO_DATA,
+                row["LikelyBSSID"],
+                row["Frames"],
+                row["Ch"],
+                row["BestRSSI"],
+                row["Vendor"],
+                row["HardwareGuess"],
+                row["HardwareConfidence"],
+                row["LocalAdmin"],
+                row["Category"],
+                row["Inference"],
+                row["SourcePCAPs"],
+            ))
+    station_csv = write_csv(station_rows, outdir, "pcap_station_master.csv")
+    station_xlsx = write_xlsx(station_rows, outdir, "pcap_station_master.xlsx")
 
     per_tbl = [(r["PCAP"], r["AP_Frames"], r["AP_UniqueBSSIDs"], r["AP_MatchedInLogs"],
                 r["AP_MatchPct"], r["Station_Frames"], r["Station_UniqueMACs"],
                 r.get("HandshakePresent","No"), r.get("EAPOL_Frames",0)) for r in per_rows]
 
+    total_ap_frames = sum(int(r.get("Frames", 0) or 0) for r in master_rows)
+    total_eapol = sum(int(r.get("EAPOLFrames", 0) or 0) for r in master_rows)
+    handshake_count = sum(1 for r in master_rows if r.get("HandshakeSeen") == "Yes")
+    matched_count = sum(1 for r in master_rows if r.get("MatchedInLogs") == "Yes")
+    top_handshakes = [
+        (
+            r.get("BSSID", NO_DATA),
+            ssid_display((ssid_counts_by_bssid.get(r.get("BSSID", ""), Counter()).most_common(1) or [("", 0)])[0][0]),
+            r.get("HandshakeConfidence", NO_DATA),
+            r.get("EAPOLFrames", 0),
+            r.get("HandshakePCAPFiles", NO_DATA),
+        )
+        for r in master_rows
+        if r.get("HandshakeSeen") == "Yes" or int(r.get("EAPOLFrames", 0) or 0) > 0
+    ][:50]
+    metric_cards = "".join(
+        f'<div class="metric"><span>{escape(label)}</span><b>{escape(str(value))}</b></div>'
+        for label, value in [
+            ("AP BSSIDs", len(master_rows)),
+            ("AP Frames", total_ap_frames),
+            ("Log Matches", matched_count),
+            ("Handshake APs", handshake_count),
+            ("EAPOL Frames", total_eapol),
+            ("PCAP Files", len(per_rows)),
+        ]
+    )
+
     html_path = os.path.join(outdir, "pcap_summary.html")
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"/><title>PCAP Evidence Report</title>
 <style>
-  body{{background:black;color:limegreen;font-family:Consolas,monospace;padding:20px}}
-  h1,h2{{color:#00ffcc;text-shadow:0 0 6px #00ffcc}}
-  table{{border-collapse:collapse;width:100%;margin:12px 0}}
-  th,td{{border:1px solid limegreen;padding:6px;vertical-align:top}}
-  a{{color:cyan;text-decoration:none}} a:hover{{text-decoration:underline}}
-  .notes{{color:#A0FFA0;font-style:italic}}
+  :root{{--bg:#050607;--panel:#07110d;--panel2:#081b14;--fg:#d7fff4;--muted:#6f9188;--accent:#00ffcc;--ok:#50ff90;--warn:#ffd080;--bad:#ff5555;--line:#163b32}}
+  *{{box-sizing:border-box}}
+  body{{margin:0;background:var(--bg);color:var(--fg);font-family:Consolas,monospace;padding:18px;line-height:1.45}}
+  h1{{margin:0;color:var(--accent);font-size:24px;letter-spacing:0;text-shadow:0 0 8px rgba(0,255,204,.45)}}
+  h2{{color:var(--accent);font-size:15px;margin:20px 0 8px;border-bottom:1px solid var(--line);padding-bottom:6px}}
+  a{{color:#7cf7ff;text-decoration:none}} a:hover{{text-decoration:underline}}
+  .nav{{position:sticky;top:0;z-index:3;display:flex;gap:8px;flex-wrap:wrap;background:rgba(5,6,7,.92);padding:8px 0 12px;margin-bottom:6px;border-bottom:1px solid var(--line)}}
+  .nav a{{border:1px solid #1f6e64;border-radius:4px;padding:4px 10px;color:#99fff0}}
+  .hero{{background:linear-gradient(135deg,rgba(0,255,204,.10),rgba(80,255,144,.04));border:1px solid var(--line);border-radius:6px;padding:14px;margin-bottom:12px}}
+  .sub{{color:var(--muted);font-size:12px;margin-top:4px}}
+  .metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:12px 0}}
+  .metric{{border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:10px}}
+  .metric span{{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}}
+  .metric b{{display:block;color:var(--ok);font-size:19px;margin-top:3px}}
+  .card{{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px;margin:12px 0;overflow:auto}}
+  table{{border-collapse:collapse;width:100%;margin:8px 0;font-size:12px}}
+  th{{position:sticky;top:45px;background:#0a2119;color:#9dfff0;text-align:left;border-bottom:1px solid var(--line);padding:7px;white-space:nowrap}}
+  td{{border-bottom:1px solid #0d241d;padding:6px 7px;vertical-align:top}}
+  tr:hover td{{background:rgba(0,255,204,.045)}}
+  .notes{{color:var(--muted);font-style:italic;font-size:12px}}
+  .meaning{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}}
+  .meaning div{{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:10px}}
+  code{{color:#9dfff0}}
 </style></head><body>
-<div style="padding:10px;border:1px solid limegreen;margin-bottom:12px">
-  <b>Navigate:</b>
+<div class="nav">
   <a href="summary.html">Summary</a> |
   <a href="map.html">Map</a> |
-  <a href="pcap_summary.html">PCAP Evidence</a>
+  <a href="pcap_summary.html">PCAP Evidence</a> |
+  <a href="pcap_bssid_master.csv">BSSID CSV</a> |
+  <a href="pcap_station_master.csv">Station CSV</a> |
+  <a href="pcap_per_file_summary.csv">Per-File CSV</a>
 </div>
-<h1>PCAP Evidence Report</h1>
-<p><b>Parser:</b> {escape(status)} | Generated: {escape(now_str())}</p>
-<p><b>OUI DB:</b> {oui_entries} entries — {escape(oui_src)}</p>
-<h2>What this means</h2>
-<ul>
-  <li><b>AP section</b>: beacons + probe-responses → strong evidence a network was on-air.</li>
-  <li><b>Stations</b>: probe/assoc requests → nearby clients searching or joining.</li>
-  <li><b>Handshake 4WAY</b> = all 4 EAPOL messages seen. PARTIAL = some. EAPOL = frames present.</li>
-</ul>
-<h2>Per-PCAP Summary</h2>
-{_html_table(["PCAP","AP_Frames","AP_BSSIDs","AP_LogMatch","AP_MatchPct","STA_Frames","STA_MACs","Handshake","EAPOL"],per_tbl)}
-<h2>Top 50 Access Points by Frames</h2>
-{_html_table(["BSSID","SSID","Frames","InLogs","Handshake","HS_Conf","EAPOL","Ch","BestRSSI","Vendor","Category"],ap_tbl)}
-<h2>Top 50 Stations by Frames</h2>
-{_html_table(["StationMAC","Frames","Ch","BestRSSI","Vendor","LocalAdmin?","Category"],sta_tbl)}
-<p class="notes">LocalAdmin=Yes → MAC is randomized; vendor and device guesses are unreliable.</p>
-<p class="notes">Parser: {escape(status)}</p>
+<section class="hero">
+  <h1>PCAP Evidence Report</h1>
+  <div class="sub">Generated {escape(now_str())} | Parser: {escape(status)} | OUI DB: {oui_entries} entries - {escape(oui_src)}</div>
+  <div class="sub">RF Device DNA registry entries: {registry_entries} | Sources: {escape(registry_src)}</div>
+</section>
+<section class="metrics">{metric_cards}</section>
+<section class="card">
+  <h2>What This Means</h2>
+  <div class="meaning">
+    <div><b>Access Points</b><br/>Beacon and probe-response frames are strong evidence a network was on-air.</div>
+    <div><b>Stations</b><br/>Probe and association frames identify nearby wireless clients and randomized devices.</div>
+    <div><b>Handshakes</b><br/>4WAY means all four EAPOL messages were seen. PARTIAL means incomplete but useful evidence. EAPOL means frames were present.</div>
+  </div>
+</section>
+<section class="card" id="handshakes">
+  <h2>Handshake Spotlight</h2>
+  {_html_table(["BSSID","SSID","Confidence","EAPOL","Source PCAPs"], top_handshakes) if top_handshakes else '<p class="notes">No handshake or EAPOL APs were flagged in this run.</p>'}
+</section>
+<section class="card">
+  <h2>Per-PCAP Summary</h2>
+  {_html_table(["PCAP","AP_Frames","AP_BSSIDs","AP_LogMatch","AP_MatchPct","STA_Frames","STA_MACs","Handshake","EAPOL"],per_tbl)}
+</section>
+<section class="card">
+  <h2>Top 50 Access Points By Frames</h2>
+  {_html_table(["BSSID","SSID","Frames","InLogs","Handshake","HS_Conf","EAPOL","Ch","BestRSSI","Vendor","HardwareGuess","HardwareConfidence","Category"],ap_tbl)}
+</section>
+<section class="card">
+  <h2>Top 50 Stations By Frames</h2>
+  {_html_table(["StationMAC","LikelySSID","LikelyBSSID","Frames","Ch","BestRSSI","Vendor","HardwareGuess","HardwareConfidence","LocalAdmin?","Category","Inference","SourcePCAPs"],sta_tbl)}
+  <p class="notes">LikelySSID comes from station probe/association request frames when present. LikelyBSSID comes from association context when present. HardwareGuess combines IEEE registry matches, WPS direct hints, vendor information elements, and RF capability fingerprints. LocalAdmin=Yes means the MAC is randomized; vendor and device guesses are unreliable.</p>
+</section>
 </body></html>
 """
     with open(html_path, "w", encoding="utf-8") as f:
@@ -650,6 +773,8 @@ def write_pcap_reports(
     return {
         "pcap_master_csv": master_csv,
         "pcap_master_xlsx": master_xlsx or NO_DATA,
+        "pcap_station_csv": station_csv,
+        "pcap_station_xlsx": station_xlsx or NO_DATA,
         "pcap_per_file_csv": per_csv,
         "pcap_summary_html": html_path,
     }

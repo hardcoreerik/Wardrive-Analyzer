@@ -31,6 +31,11 @@ Projects/*/evidence/
 Projects/*/exports/
 Projects/*/runs/
 
+# Archives
+*.rar
+*.zip
+*.7z
+
 # OS
 .DS_Store
 Thumbs.db
