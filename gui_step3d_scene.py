@@ -8,9 +8,11 @@ import subprocess
 import hashlib
 import logging
 import re
+import time
+import json
 from dataclasses import dataclass
 from datetime import datetime
-from error_logger import write_error_report
+from error_logger import write_diagnostic_snapshot, write_error_report
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QElapsedTimer, QRect, QRectF, QPointF, QUrl
 from PySide6.QtGui import QPainter, QLinearGradient, QColor, QFont, QPen, QBrush, QPixmap, QDesktopServices, QMovie
@@ -70,6 +72,17 @@ from project_vault import (
     compare_run_masters,
     export_wigle_csv,
     export_wpasec_list,
+)
+from mascot_engine import MascotEngine, MascotState
+from buddy_ai import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    BuddyAIClient,
+    BuddyAIConfig,
+    build_buddy_context,
+    load_token_from_keyring,
+    local_buddy_summary,
+    save_token_to_keyring,
 )
 
 
@@ -563,8 +576,10 @@ class AnalyzeWorker(QThread):
         self.project_dir = project_dir
 
     def run(self):
+        request_path = ""
+        proc = None
         try:
-            def cb(msg: str):
+            def handle_stage(msg: str):
                 msg = _safe_gui_text(msg, limit=1200)
                 self.stage.emit(msg)
 
@@ -583,9 +598,83 @@ class AnalyzeWorker(QThread):
             self.stage.emit("Boot sequence… Initializing run folder")
             self.stage.emit(f"Wardrive logs queued: {len(self.wardrive_files)}")
             self.stage.emit(f"PCAP captures queued: {len(self.pcap_files)}")
-            self.stage.emit("Executing analyzer…")
+            self.stage.emit("Executing analyzer in isolated subprocess…")
 
-            results = analyze(self.wardrive_files, self.pcap_files, self.project_dir, status_cb=cb)
+            reports_dir = os.path.join(os.getcwd(), "error_reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            request_path = os.path.join(reports_dir, f"analysis_request_{os.getpid()}_{int(time.time())}.json")
+            with open(request_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "project_dir": self.project_dir,
+                        "wardrive_files": self.wardrive_files,
+                        "pcap_files": self.pcap_files,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            script = resource_path("analysis_subprocess.py")
+            child_python = sys.executable
+            if os.path.basename(child_python).lower() == "pythonw.exe":
+                candidate = os.path.join(os.path.dirname(child_python), "python.exe")
+                if os.path.exists(candidate):
+                    child_python = candidate
+            proc = subprocess.Popen(
+                [child_python, script, request_path],
+                cwd=os.getcwd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            stderr_lines: list[str] = []
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                line = line.strip()
+                if not line:
+                    continue
+                stderr_lines.append(line)
+                try:
+                    event = json.loads(line)
+                    msg = str(event.get("event", line))
+                except Exception:
+                    msg = line
+                handle_stage(msg)
+
+            assert proc.stdout is not None
+            stdout = proc.stdout.read()
+            return_code = proc.wait()
+
+            data = None
+            for line in reversed([x.strip() for x in stdout.splitlines() if x.strip()]):
+                try:
+                    data = json.loads(line)
+                    break
+                except Exception:
+                    continue
+
+            if return_code != 0:
+                detail = f"Analyzer subprocess exited with code {return_code}."
+                if data and data.get("error"):
+                    detail += f"\n{data.get('error')}"
+                if data and data.get("report"):
+                    detail += f"\nReport: {data.get('report')}"
+                if stdout.strip():
+                    detail += f"\n\nstdout tail:\n{stdout[-2000:]}"
+                if stderr_lines:
+                    detail += f"\n\nstderr tail:\n" + "\n".join(stderr_lines[-20:])
+                self.failed.emit(_safe_gui_text(detail, limit=5000))
+                return
+
+            if not data or data.get("status") != "ok":
+                self.failed.emit(_safe_gui_text(f"Analyzer subprocess returned unexpected output:\n{stdout[-3000:]}", limit=5000))
+                return
+
+            results = data.get("results") or {}
 
             self.stage.emit("Complete.")
             self.done.emit(results)
@@ -607,6 +696,12 @@ class AnalyzeWorker(QThread):
             self.stage.emit(f"Error report written: {report}")
             self.stage.emit(trace)
             self.failed.emit(f"{err}\n\nReport: {report}")
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 # -----------------------------
@@ -683,6 +778,35 @@ class IngestWorker(QThread):
             self.failed.emit(str(e))
 
 
+class BuddyAIWorker(QThread):
+    done = Signal(str, str, bool)      # action, response, used_ai
+    failed = Signal(str, str, str)     # action, error, fallback
+
+    def __init__(self, project_dir: str, action: str, config: BuddyAIConfig):
+        super().__init__()
+        self.project_dir = project_dir
+        self.action = action
+        self.config = config
+
+    def run(self):
+        try:
+            context = build_buddy_context(self.project_dir, self.action)
+            used_ai = bool(self.config.enabled and self.config.api_key.strip())
+            response = BuddyAIClient(self.config).ask(self.action, context)
+            self.done.emit(self.action, _safe_gui_text(response, limit=1200), used_ai)
+        except Exception as e:
+            try:
+                context = build_buddy_context(self.project_dir, self.action)
+                fallback = local_buddy_summary(self.action, context)
+            except Exception:
+                fallback = "I could not read that project state yet. Check the console, then try again."
+            self.failed.emit(
+                self.action,
+                _safe_gui_text(str(e), limit=900),
+                _safe_gui_text(fallback, limit=1200),
+            )
+
+
 # -----------------------------
 # Main GUI
 # -----------------------------
@@ -719,6 +843,9 @@ class WardriveGUI(QWidget):
         self._scan_worker: ScanWorker | None = None
         self._scan_job_id: int | None = None
         self._sd_scan_folder: str = ""
+        self.mascot = MascotEngine()
+        self._buddy_ai_worker: BuddyAIWorker | None = None
+        self._buddy_override_until: float = 0.0
 
         # Run-state + progress / ETA tracking
         self._running: bool = False
@@ -770,7 +897,10 @@ class WardriveGUI(QWidget):
         self.right_panel.setObjectName("RightPane")
         self.right_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.right_panel.setMinimumWidth(260)
-        # NOTE: Leave empty for now; background art remains visible behind it.
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+        right_layout.addWidget(self._build_buddy_panel(), 1)
         mid_row.addWidget(self.right_panel, 1)
 
         overlay_v.addLayout(mid_row, 1)
@@ -799,6 +929,11 @@ class WardriveGUI(QWidget):
             pass
         self.refresh_mission_control()
         self._log(f"Background: {self.demoscene.current_name}")
+        self._buddy_timer = QTimer(self)
+        self._buddy_timer.setInterval(900)
+        self._buddy_timer.timeout.connect(self._tick_buddy)
+        self._buddy_timer.start()
+        self._tick_buddy()
 
         # Fire boot sequence after event loop starts (100ms delay)
         QTimer.singleShot(100, self._boot_sequence)
@@ -874,6 +1009,65 @@ class WardriveGUI(QWidget):
             pass
 
         return self.tabs
+
+    def _build_buddy_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("BuddyFrame")
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(10)
+
+        title = QLabel("WARDEN // BUDDY")
+        title.setObjectName("BuddyTitle")
+        v.addWidget(title)
+
+        self.lbl_buddy_pose = QLabel("[START]  (._.)  standing by")
+        self.lbl_buddy_pose.setObjectName("BuddyPose")
+        self.lbl_buddy_pose.setWordWrap(True)
+        self.lbl_buddy_pose.setMinimumHeight(76)
+        self.lbl_buddy_pose.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.lbl_buddy_pose)
+
+        self.lbl_buddy_bubble = QLabel("Ready when you are, operator.")
+        self.lbl_buddy_bubble.setObjectName("BuddyBubble")
+        self.lbl_buddy_bubble.setWordWrap(True)
+        self.lbl_buddy_bubble.setMinimumHeight(84)
+        v.addWidget(self.lbl_buddy_bubble)
+
+        self.cmb_buddy_action = QComboBox()
+        self.cmb_buddy_action.addItem("Suggest next step", "next_step")
+        self.cmb_buddy_action.addItem("Summarize latest run", "summarize_latest_run")
+        self.cmb_buddy_action.addItem("Evidence health check", "evidence_health")
+        self.cmb_buddy_action.addItem("Strongest unknown APs", "strongest_unknown_aps")
+        self.cmb_buddy_action.addItem("Compare latest runs", "compare_latest_runs")
+        self.cmb_buddy_action.addItem("Flag suspicious handshakes", "suspicious_handshakes")
+        v.addWidget(self.cmb_buddy_action)
+
+        row = QHBoxLayout()
+        self.btn_buddy_ask = QPushButton("Ask Buddy")
+        self.btn_buddy_ask.setObjectName("PrimaryButton")
+        self.btn_buddy_ask.clicked.connect(self._buddy_ask_selected)
+        self.btn_buddy_local = QPushButton("Local Tip")
+        self.btn_buddy_local.clicked.connect(self._buddy_local_selected)
+        row.addWidget(self.btn_buddy_ask)
+        row.addWidget(self.btn_buddy_local)
+        v.addLayout(row)
+
+        self.txt_buddy_readout = QTextEdit()
+        self.txt_buddy_readout.setObjectName("BuddyReadout")
+        self.txt_buddy_readout.setReadOnly(True)
+        self.txt_buddy_readout.setMinimumHeight(150)
+        self.txt_buddy_readout.setPlainText(
+            "Offline buddy is active. Add an AI token in Settings to unlock model-backed readouts."
+        )
+        v.addWidget(self.txt_buddy_readout, 1)
+
+        privacy = QLabel("AI mode sends compact sanitized summaries only. Raw PCAPs, tokens, and full paths stay local.")
+        privacy.setObjectName("BuddyPrivacy")
+        privacy.setWordWrap(True)
+        v.addWidget(privacy)
+
+        return panel
 
     def _make_table(self, headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
@@ -1506,6 +1700,40 @@ class WardriveGUI(QWidget):
         w_row.addWidget(self.cmb_pcap_workers)
         v.addLayout(w_row)
 
+        ai_title = QLabel("AI Buddy")
+        ai_title.setObjectName("PanelTitle")
+        v.addWidget(ai_title)
+
+        self.chk_buddy_ai_enabled = QCheckBox("Enable model-backed Buddy responses")
+        self.chk_buddy_ai_enabled.setChecked(False)
+        v.addWidget(self.chk_buddy_ai_enabled)
+
+        self.chk_buddy_sanitize = QCheckBox("Send sanitized summaries only")
+        self.chk_buddy_sanitize.setChecked(True)
+        self.chk_buddy_sanitize.setEnabled(False)
+        v.addWidget(self.chk_buddy_sanitize)
+
+        ai_base_row = QHBoxLayout()
+        ai_base_row.addWidget(QLabel("OpenAI-compatible base URL:"))
+        self.txt_buddy_base_url = QLineEdit(DEFAULT_BASE_URL)
+        ai_base_row.addWidget(self.txt_buddy_base_url)
+        v.addLayout(ai_base_row)
+
+        ai_model_row = QHBoxLayout()
+        ai_model_row.addWidget(QLabel("Model:"))
+        self.txt_buddy_model = QLineEdit(DEFAULT_MODEL)
+        ai_model_row.addWidget(self.txt_buddy_model)
+        v.addLayout(ai_model_row)
+
+        self.txt_buddy_api_token = QLineEdit()
+        self.txt_buddy_api_token.setEchoMode(QLineEdit.Password)
+        self.txt_buddy_api_token.setPlaceholderText("API token (keyring preferred; local project fallback)")
+        v.addWidget(self.txt_buddy_api_token)
+
+        self.lbl_buddy_ai_status = QLabel("Buddy AI: offline/local mode")
+        self.lbl_buddy_ai_status.setObjectName("Notes")
+        v.addWidget(self.lbl_buddy_ai_status)
+
         btn_save = QPushButton("Save Settings")
         btn_save.clicked.connect(self._save_settings)
         btn_load = QPushButton("Load Settings")
@@ -1587,6 +1815,18 @@ class WardriveGUI(QWidget):
             set_setting(db, "auto_open_run", "1" if self.chk_setting_auto_open.isChecked() else "0")
             set_setting(db, "bg_mode", self.cmb_bg_mode.currentText())
             set_setting(db, "pcap_workers", self.cmb_pcap_workers.currentText())
+            set_setting(db, "buddy_ai_enabled", "1" if self.chk_buddy_ai_enabled.isChecked() else "0")
+            set_setting(db, "buddy_ai_sanitize", "1" if self.chk_buddy_sanitize.isChecked() else "0")
+            set_setting(db, "buddy_ai_base_url", self.txt_buddy_base_url.text().strip() or DEFAULT_BASE_URL)
+            set_setting(db, "buddy_ai_model", self.txt_buddy_model.text().strip() or DEFAULT_MODEL)
+            token = self.txt_buddy_api_token.text().strip()
+            if token and save_token_to_keyring(self.project_dir, token):
+                set_setting(db, "buddy_ai_token", "")
+                set_setting(db, "buddy_ai_token_store", "keyring")
+            else:
+                set_setting(db, "buddy_ai_token", token)
+                set_setting(db, "buddy_ai_token_store", "project_db" if token else "")
+            self._refresh_buddy_ai_status()
             self._log("Settings saved.")
         except Exception as e:
             QMessageBox.critical(self, "Settings Error", str(e))
@@ -1609,6 +1849,16 @@ class WardriveGUI(QWidget):
             idx = self.cmb_pcap_workers.findText(workers)
             if idx >= 0:
                 self.cmb_pcap_workers.setCurrentIndex(idx)
+            self.chk_buddy_ai_enabled.setChecked(get_setting(db, "buddy_ai_enabled", "0") == "1")
+            self.chk_buddy_sanitize.setChecked(True)
+            self.txt_buddy_base_url.setText(get_setting(db, "buddy_ai_base_url", DEFAULT_BASE_URL) or DEFAULT_BASE_URL)
+            self.txt_buddy_model.setText(get_setting(db, "buddy_ai_model", DEFAULT_MODEL) or DEFAULT_MODEL)
+            token_store = get_setting(db, "buddy_ai_token_store", "")
+            token = load_token_from_keyring(self.project_dir) if token_store == "keyring" else ""
+            if not token:
+                token = get_setting(db, "buddy_ai_token", "")
+            self.txt_buddy_api_token.setText(token)
+            self._refresh_buddy_ai_status()
             self._log("Settings loaded.")
         except Exception:
             pass
@@ -1790,6 +2040,7 @@ class WardriveGUI(QWidget):
 
         if runs:
             latest = runs[0]
+            expected_count = len((latest.get("outputs") or {})) or 9
             self._project_last_run_dir = str(latest.get("run_dir") or "")
             outputs = latest.get("outputs") or {}
             if isinstance(outputs, dict):
@@ -1797,7 +2048,7 @@ class WardriveGUI(QWidget):
                 self._project_last_map = str(outputs.get("map.html") or "") or None
                 self._project_last_pcap_summary = str(outputs.get("pcap_summary.html") or "") or None
             self.lbl_dash_latest_run.setText(
-                f"Latest run: {latest.get('run_id', '')}  outputs {latest.get('present_count', 0)}/9"
+                f"Latest run: {latest.get('run_id', '')}  outputs {latest.get('present_count', 0)}/{expected_count}"
             )
             self.lbl_latest.setText(f"Latest run: {self._project_last_run_dir}")
             self.btn_open_latest.setEnabled(bool(self._project_last_summary))
@@ -1838,13 +2089,14 @@ class WardriveGUI(QWidget):
 
         self.tbl_runs.setRowCount(0)
         for run in runs:
+            expected_count = len((run.get("outputs") or {})) or 9
             r = self.tbl_runs.rowCount()
             self.tbl_runs.insertRow(r)
             missing = run.get("missing") or []
             vals = [
                 run.get("run_id", ""),
                 run.get("modified", ""),
-                f"{run.get('present_count', 0)}/9",
+                f"{run.get('present_count', 0)}/{expected_count}",
                 ", ".join(missing[:3]) + (" ..." if len(missing) > 3 else ""),
                 run.get("run_dir", ""),
             ]
@@ -1917,6 +2169,129 @@ class WardriveGUI(QWidget):
         self._log(
             f"Run comparison: new={diff.get('added_count', 0)} missing={diff.get('missing_count', 0)} changed={diff.get('changed_count', 0)}"
         )
+
+    # -----------------------------
+    # Buddy companion
+    # -----------------------------
+    def _set_buddy_state(self, state: MascotState) -> None:
+        try:
+            self.mascot.set_state(state)
+            self._tick_buddy()
+        except Exception:
+            pass
+
+    def _buddy_say(self, text: str, seconds: float = 45.0, append: bool = True) -> None:
+        text = _safe_gui_text(text, limit=1200)
+        self._buddy_override_until = time.time() + seconds
+        try:
+            self.lbl_buddy_bubble.setText(text)
+        except Exception:
+            pass
+        if append:
+            try:
+                stamp = datetime.now().strftime("%H:%M:%S")
+                self.txt_buddy_readout.append(f"[{stamp}] {text}")
+            except Exception:
+                pass
+
+    def _tick_buddy(self) -> None:
+        try:
+            render = self.mascot.tick()
+            self.lbl_buddy_pose.setText(render.frame_text)
+            if time.time() >= getattr(self, "_buddy_override_until", 0.0):
+                self.lbl_buddy_bubble.setText(render.bubble_text)
+        except Exception:
+            pass
+
+    def _buddy_config_from_ui(self, force_local: bool = False) -> BuddyAIConfig:
+        enabled = False if force_local else bool(getattr(self, "chk_buddy_ai_enabled", None) and self.chk_buddy_ai_enabled.isChecked())
+        return BuddyAIConfig(
+            enabled=enabled,
+            api_key=self.txt_buddy_api_token.text().strip() if hasattr(self, "txt_buddy_api_token") else "",
+            base_url=self.txt_buddy_base_url.text().strip() if hasattr(self, "txt_buddy_base_url") else DEFAULT_BASE_URL,
+            model=self.txt_buddy_model.text().strip() if hasattr(self, "txt_buddy_model") else DEFAULT_MODEL,
+            sanitize_only=bool(getattr(self, "chk_buddy_sanitize", None) and self.chk_buddy_sanitize.isChecked()),
+        )
+
+    def _refresh_buddy_ai_status(self) -> None:
+        lbl = getattr(self, "lbl_buddy_ai_status", None)
+        if lbl is None:
+            return
+        enabled = bool(getattr(self, "chk_buddy_ai_enabled", None) and self.chk_buddy_ai_enabled.isChecked())
+        has_token = bool(getattr(self, "txt_buddy_api_token", None) and self.txt_buddy_api_token.text().strip())
+        if enabled and has_token:
+            store = "local project fallback"
+            if self.project_dir:
+                try:
+                    db = os.path.join(self.project_dir, "project.db")
+                    if get_setting(db, "buddy_ai_token_store", "") == "keyring":
+                        store = "system keyring"
+                except Exception:
+                    pass
+            lbl.setText(f"Buddy AI: enabled; token store: {store}; sanitized readouts available")
+        elif enabled:
+            lbl.setText("Buddy AI: enabled but no token saved")
+        else:
+            lbl.setText("Buddy AI: offline/local mode")
+
+    def _buddy_selected_action(self) -> str:
+        try:
+            return str(self.cmb_buddy_action.currentData() or "next_step")
+        except Exception:
+            return "next_step"
+
+    def _buddy_ask_selected(self) -> None:
+        self._run_buddy_action(self._buddy_selected_action(), force_local=False)
+
+    def _buddy_local_selected(self) -> None:
+        self._run_buddy_action(self._buddy_selected_action(), force_local=True)
+
+    def _run_buddy_action(self, action: str, force_local: bool = False) -> None:
+        if not self.project_dir:
+            self._buddy_say("Select a project first. I need a vault before I can read the room.")
+            QMessageBox.information(self, "Buddy", "Select a Project Folder first.")
+            return
+        if getattr(self, "_buddy_ai_worker", None) is not None:
+            self._buddy_say("Already thinking. Give me a second; dramatic pauses are part of the service.")
+            return
+
+        config = self._buddy_config_from_ui(force_local=force_local)
+        mode = "local" if force_local or not (config.enabled and config.api_key.strip()) else "AI"
+        self._buddy_say(f"Running {mode} readout: {action.replace('_', ' ')}...", seconds=20.0, append=False)
+        try:
+            self.btn_buddy_ask.setEnabled(False)
+            self.btn_buddy_local.setEnabled(False)
+        except Exception:
+            pass
+
+        worker = BuddyAIWorker(self.project_dir, action, config)
+        self._buddy_ai_worker = worker
+        worker.done.connect(self._on_buddy_done)
+        worker.failed.connect(self._on_buddy_failed)
+        try:
+            worker.finished.connect(worker.deleteLater)
+        except Exception:
+            pass
+        worker.start()
+
+    def _finish_buddy_worker(self) -> None:
+        self._buddy_ai_worker = None
+        try:
+            self.btn_buddy_ask.setEnabled(True)
+            self.btn_buddy_local.setEnabled(True)
+        except Exception:
+            pass
+
+    def _on_buddy_done(self, action: str, response: str, used_ai: bool) -> None:
+        self._finish_buddy_worker()
+        source = "AI" if used_ai else "local"
+        self._buddy_say(response, seconds=60.0)
+        self._log(f"Buddy {source} readout complete: {action}", "OK")
+
+    def _on_buddy_failed(self, action: str, error: str, fallback: str) -> None:
+        self._finish_buddy_worker()
+        self._buddy_say(fallback, seconds=60.0)
+        self._log_warn(f"Buddy AI fallback for {action}: {error}")
 
     # -----------------------------
     # Helpers
@@ -2144,6 +2519,7 @@ class WardriveGUI(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select Project Folder")
         if folder:
             self.project_dir = folder
+            self._set_buddy_state(MascotState.FOLDER_SELECTED)
             db_path = os.path.join(folder, "project.db")
             existed_before = os.path.exists(db_path)
             ensure_project_vault(folder)
@@ -2205,6 +2581,7 @@ class WardriveGUI(QWidget):
             self._load_settings()
             self.refresh_mission_control()
             self._update_onboarding_checklist()
+            self._buddy_say("Project locked. I can summarize runs, inspect evidence health, or suggest the next move.")
 
     def open_last_summary(self):
         p = getattr(self, "_project_last_summary", None)
@@ -2273,6 +2650,7 @@ class WardriveGUI(QWidget):
             added += 1
         if added:
             self._log(f"Loaded {added} log(s).")
+            self._set_buddy_state(MascotState.LOGS_ADDED)
         if skipped:
             self._log(f"Duplicate logs skipped: {skipped} (fingerprint match)")
 
@@ -2303,6 +2681,7 @@ class WardriveGUI(QWidget):
             added += 1
         if added:
             self._log(f"Loaded {added} PCAP(s).")
+            self._set_buddy_state(MascotState.PCAPS_ADDED)
         if skipped:
             self._log(f"Duplicate PCAPs skipped: {skipped} (fingerprint match)")
 
@@ -2339,8 +2718,25 @@ class WardriveGUI(QWidget):
             QMessageBox.warning(self, "Missing Project Folder", "Select a Project Folder first.")
             return
 
+        try:
+            snapshot = write_diagnostic_snapshot(
+                "analysis_start",
+                context={
+                    "project_dir": self.project_dir,
+                    "wardrive_files": len(self.wardrive_files),
+                    "pcap_files": len(self.pcap_files),
+                    "mode": "manual_or_project_analysis",
+                    "first_wardrive_files": [os.path.basename(p) for p in self.wardrive_files[:10]],
+                    "first_pcap_files": [os.path.basename(p) for p in self.pcap_files[:10]],
+                },
+            )
+            self._log(f"Crash diagnostics armed: {snapshot}", "DEBUG")
+        except Exception as exc:
+            self._log_warn(f"Could not write analysis diagnostic snapshot: {exc}")
+
         self._log(f"=== ANALYZE === {len(self.wardrive_files)} log(s) + {len(self.pcap_files)} PCAP(s)", "SCAN")
         self._log("Wardrive logs = GPS evidence. PCAPs = radio/handshake evidence.", "INFO")
+        self._set_buddy_state(MascotState.ANALYZING)
         job_id = self._new_job("Analysis", f"{len(self.wardrive_files)} logs, {len(self.pcap_files)} pcaps")
         self._set_running(True)
         self._log("Engine initializing — parsing evidence, computing centroids, rendering HTML…", "BOOT")
@@ -2491,6 +2887,20 @@ class WardriveGUI(QWidget):
         QMessageBox.information(self, "Complete", msg)
 
         self._log("=== ANALYSIS COMPLETE === all artifacts written.", "OK")
+        self._set_buddy_state(MascotState.DONE)
+        self._buddy_say("Reports are generated. I can summarize the latest run or compare it against the previous one.")
+        try:
+            write_diagnostic_snapshot(
+                "analysis_complete",
+                context={
+                    "project_dir": self.project_dir,
+                    "run_dir": self._latest_run_dir or "",
+                    "summary": self._latest_summary or "",
+                    "outputs": sorted(str(k) for k in results.keys()),
+                },
+            )
+        except Exception:
+            pass
         for k in ("csv", "xlsx", "map", "summary", "pcap_summary_html", "pcap_master_csv", "kml"):
             if k in results:
                 try:
@@ -2547,7 +2957,20 @@ class WardriveGUI(QWidget):
             pass
         self._stop_analysis_heartbeat()
         self._set_running(False)
+        self._set_buddy_state(MascotState.ERROR)
         self._log_err(f"ANALYSIS FAILED: {err}")
+        try:
+            write_diagnostic_snapshot(
+                "analysis_failed",
+                context={
+                    "project_dir": self.project_dir,
+                    "error": err,
+                    "wardrive_files": len(getattr(self, "wardrive_files", []) or []),
+                    "pcap_files": len(getattr(self, "pcap_files", []) or []),
+                },
+            )
+        except Exception:
+            pass
         self._update_job(
             getattr(self, "_active_job_id", None),
             status="Failed",
@@ -2617,6 +3040,10 @@ class WardriveGUI(QWidget):
         total_mb  = sum(c.size for c in candidates) / (1024 * 1024)
 
         self._log_scan(f"Found {len(candidates)} files ({total_mb:.1f} MB)  |  {rec_count} recommended")
+        if any(c.kind.lower().startswith("pcap") or "pcap" in c.kind.lower() for c in candidates):
+            self._set_buddy_state(MascotState.PCAPS_ADDED)
+        elif candidates:
+            self._set_buddy_state(MascotState.LOGS_ADDED)
         for app, n in sorted(by_app.items()):
             self._log(f"  [{app}]  {n} file(s)", "OK" if app != "unknown" else "WARN")
 
@@ -2653,6 +3080,7 @@ class WardriveGUI(QWidget):
 
     def _on_scan_failed(self, err: str):
         self._scan_worker = None
+        self._set_buddy_state(MascotState.ERROR)
         self._log_err(f"SD scan failed: {err}")
         self.lbl_sd_root.setText("SD folder: (scan failed)")
         try:
@@ -2863,6 +3291,7 @@ class WardriveGUI(QWidget):
         )
         lvl = "ERROR" if stats["errors"] else "OK"
         self._log(f"=== INGEST COMPLETE === {summary}", lvl)
+        self._set_buddy_state(MascotState.LOGS_ADDED if stats["errors"] == 0 else MascotState.ERROR)
         if stats["errors"]:
             self._log_warn("Some files failed to copy — check console for details.")
 
@@ -2906,6 +3335,7 @@ class WardriveGUI(QWidget):
     def _on_ingest_failed(self, err: str):
         self._ingest_worker = None
         self._ingest_file_active = False
+        self._set_buddy_state(MascotState.ERROR)
         self._log_err(f"Ingest failed: {err}")
         self.btn_sd_ingest.setEnabled(True)
         self.btn_sd_ingest.setText("Attach Selected to Project")

@@ -105,8 +105,10 @@ _PROJECT_OUTPUT_FILENAMES = {
     "wardrive_map.kml",
     "pcap_summary.html",
     "pcap_bssid_master.csv",
+    "pcap_station_master.csv",
     "pcap_per_file_summary.csv",
     "pcap_bssid_master.xlsx",
+    "pcap_station_master.xlsx",
     "project.db",
 }
 
@@ -314,6 +316,8 @@ def discover_project_runs(project_dir: str) -> List[Dict[str, object]]:
         "pcap_summary.html",
         "pcap_bssid_master.csv",
         "pcap_bssid_master.xlsx",
+        "pcap_station_master.csv",
+        "pcap_station_master.xlsx",
         "pcap_per_file_summary.csv",
     ]
     runs: List[Dict[str, object]] = []

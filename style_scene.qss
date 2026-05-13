@@ -197,3 +197,46 @@ QWidget#DemoscenePanel {
     border: 1px solid rgba(0, 255, 208, 55);
     border-radius: 14px;
 }
+
+QFrame#BuddyFrame {
+    background: rgba(0, 0, 0, 92);
+    border: 1px solid rgba(0, 255, 208, 95);
+    border-radius: 12px;
+}
+
+QLabel#BuddyTitle {
+    color: #00ffd0;
+    font-weight: 700;
+    font-size: 13pt;
+}
+
+QLabel#BuddyPose {
+    background: rgba(0, 0, 0, 120);
+    border: 1px solid rgba(0, 255, 208, 75);
+    border-radius: 8px;
+    color: #ff4fd8;
+    font-size: 10pt;
+    padding: 10px;
+}
+
+QLabel#BuddyBubble {
+    background: rgba(0, 24, 22, 150);
+    border: 1px solid rgba(0, 255, 208, 70);
+    border-radius: 8px;
+    color: rgba(220, 255, 248, 235);
+    padding: 10px;
+}
+
+QTextEdit#BuddyReadout {
+    background: rgba(0, 0, 0, 130);
+    border: 1px solid rgba(0, 255, 208, 65);
+    border-radius: 8px;
+    color: rgba(202, 255, 240, 225);
+    padding: 8px;
+    font-size: 10pt;
+}
+
+QLabel#BuddyPrivacy {
+    color: rgba(202, 255, 240, 175);
+    font-size: 9pt;
+}

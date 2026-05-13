@@ -13,6 +13,7 @@ from .constants import NO_DATA, CORE_REVISION
 from .helpers import now_str
 from .parser_logs import load_wardrive_logs, Sighting
 from .parser_pcap import load_pcaps
+from .hardware_identity import load_registry_db, summarize_identity
 from .geo import compute_centroid_and_confidence, stability_score, compute_risk
 from .writers import (
     write_csv, write_xlsx, write_kml, write_map_html,
@@ -104,6 +105,8 @@ def analyze(
         ap_bssids, ap_per_pcap, sta_per_pcap,
         ssid_by_bssid, ch_by_ap, rssi_ap,
         ch_by_sta, rssi_sta,
+        ssid_by_sta, bssid_by_sta,
+        identity_by_mac,
         pcaps_by_ap, pcaps_by_sta,
         eapol_per_pcap, eapol_by_bssid, handshake_conf,
         pcap_status,
@@ -112,6 +115,7 @@ def analyze(
     # 4. Build centroid master table
     centroids: List[dict] = []
     centroid_points: List[Tuple[float, float]] = []
+    registry_db, _registry_src, _registry_entries = load_registry_db()
 
     for mac, sights in sightings_by_mac.items():
         ssids = [s.ssid for s in sights if s.ssid not in (None, "", NO_DATA)]
@@ -143,6 +147,12 @@ def analyze(
         eapol_f = int(eapol_by_bssid.get(mac, 0)) if isinstance(eapol_by_bssid, dict) else 0
         hs_conf = handshake_conf.get(mac, "EAPOL" if eapol_f > 0 else "NONE") if isinstance(handshake_conf, dict) else "NONE"
         risk = compute_risk(auth_mode, top_ssid, best_rssi)
+        identity = summarize_identity(
+            mac,
+            "AP" if mac in ap_bssids else "STA",
+            identity_by_mac.get(mac, Counter()),
+            registry_db,
+        )
 
         centroids.append({
             "MAC": mac,
@@ -172,6 +182,7 @@ def analyze(
             "RiskScore": risk,
             "SeenInPCAP": "Yes" if mac in ap_bssids else "No",
             "PCAPFiles": ", ".join(sorted(pcaps_by_ap.get(mac, set()))) or NO_DATA,
+            **identity,
             "LogFiles": ", ".join(source_files) or NO_DATA,
         })
 
@@ -233,6 +244,9 @@ def analyze(
         best_rssi_by_ap=rssi_ap,
         ch_counts_by_sta=ch_by_sta,
         best_rssi_by_sta=rssi_sta,
+        ssid_counts_by_sta=ssid_by_sta,
+        bssid_counts_by_sta=bssid_by_sta,
+        identity_counts_by_mac=identity_by_mac,
         pcaps_by_ap=pcaps_by_ap,
         pcaps_by_sta=pcaps_by_sta,
         eapol_per_pcap=eapol_per_pcap,
@@ -263,7 +277,9 @@ def analyze(
     _emit_checklist(status_cb, run_dir, [
         "wardrive_master.csv", "wardrive_master.xlsx", "wardrive_map.kml",
         "map.html", "summary.html", "pcap_summary.html",
-        "pcap_bssid_master.csv", "pcap_bssid_master.xlsx", "pcap_per_file_summary.csv",
+        "pcap_bssid_master.csv", "pcap_bssid_master.xlsx",
+        "pcap_station_master.csv", "pcap_station_master.xlsx",
+        "pcap_per_file_summary.csv",
     ])
 
     return results
