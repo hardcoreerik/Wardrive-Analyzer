@@ -84,6 +84,7 @@ from buddy_ai import (
     local_buddy_summary,
     save_token_to_keyring,
 )
+from dropbox_sync import sync_project_to_dropbox
 
 
 # -----------------------------
@@ -808,10 +809,85 @@ class BuddyAIWorker(QThread):
 
 
 # -----------------------------
+# WIA Intelligence worker thread
+# -----------------------------
+
+class WIAWorker(QThread):
+    """
+    Background thread: loads assistant_engine, reads the wardrive CSV, and
+    emits one card at a time so the UI can render progressively.
+
+    Signals
+    -------
+    card_ready(dict)      — one card emitted per insight; keys match AssistantCard fields
+    score_ready(int, str) — (score 0-100, grade A-F) emitted after cards
+    finished_analysis(int) — total card count emitted when done
+    """
+    card_ready        = Signal(dict)
+    score_ready       = Signal(int, str, str)   # score, grade, summary
+    finished_analysis = Signal(int)
+
+    def __init__(self, results: dict, parent=None):
+        super().__init__(parent)
+        self.results = results
+
+    def run(self):
+        try:
+            from assistant_engine import WIAEngine
+            engine = WIAEngine()
+            cards  = engine.analyze_results(self.results)
+
+            quality = engine.get_quality()
+            if quality is not None:
+                self.score_ready.emit(quality.score, quality.grade, quality.summary)
+
+            for card in cards:
+                self.card_ready.emit({
+                    "title":            card.title,
+                    "fact":             card.fact,
+                    "severity":         card.severity.value,
+                    "confidence":       card.confidence.value,
+                    "interpretation":   card.interpretation,
+                    "educational_note": card.educational_note,
+                    "mascot_flavor":    card.mascot_flavor,
+                    "recommendation":   card.recommendation,
+                    "timestamp":        card.timestamp,
+                })
+            self.finished_analysis.emit(len(cards))
+        except Exception as exc:
+            import traceback as _tb
+            # Emit a single error card rather than crashing
+            self.card_ready.emit({
+                "title":      "WIA Engine Error",
+                "fact":       str(exc),
+                "severity":   "WARN",
+                "confidence": "HIGH CONFIDENCE",
+                "interpretation": _tb.format_exc()[-800:],
+                "educational_note": "",
+                "mascot_flavor": "The assistant hit a snag. Check the console.",
+                "recommendation": "",
+                "timestamp":  datetime.now().strftime("%H:%M:%S"),
+            })
+            self.finished_analysis.emit(0)
+
+
+# -----------------------------
 # Main GUI
 # -----------------------------
 
 class WardriveGUI(QWidget):
+    # Maps mascot pose_id → PNG filename in assets/mascot/
+    _MASCOT_PNG: dict = {
+        "POSE_START":        "start.png",
+        "POSE_LOGS":         "logs_added.png",
+        "POSE_PCAPS":        "pcaps_added.png",
+        "POSE_FOLDER":       "folder_selected.png",
+        "POSE_ANALYZING":    "analyzing.png",
+        "POSE_DONE":         "finished.png",
+        "POSE_ERROR":        "error.png",
+        "POSE_IDLE_SPECIAL": "start.png",
+    }
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Wardrive Mission Control")
@@ -844,7 +920,10 @@ class WardriveGUI(QWidget):
         self._scan_job_id: int | None = None
         self._sd_scan_folder: str = ""
         self.mascot = MascotEngine()
+        self._mascot_pixmap_cache: dict = {}
+        self._mascot_bob_phase: float = 0.0
         self._buddy_ai_worker: BuddyAIWorker | None = None
+        self._wia_worker: WIAWorker | None = None
         self._buddy_override_until: float = 0.0
 
         # Run-state + progress / ETA tracking
@@ -992,8 +1071,10 @@ class WardriveGUI(QWidget):
         self.tab_sd = self._build_sd_ingest_tab()
         self.tab_integrations = self._build_integrations_tab()
         self.tab_settings = self._build_settings_tab()
+        self.tab_intelligence = self._build_intelligence_tab()
 
         self.tabs.addTab(self.tab_dashboard, "Dashboard")
+        self.tabs.addTab(self.tab_intelligence, "Intelligence")
         self.tabs.addTab(self.tab_evidence, "Evidence Vault")
         self.tabs.addTab(self.tab_sd, "SD Ingest")
         self.tabs.addTab(self.tab_jobs, "Jobs")
@@ -1021,11 +1102,11 @@ class WardriveGUI(QWidget):
         title.setObjectName("BuddyTitle")
         v.addWidget(title)
 
-        self.lbl_buddy_pose = QLabel("[START]  (._.)  standing by")
+        self.lbl_buddy_pose = QLabel()
         self.lbl_buddy_pose.setObjectName("BuddyPose")
-        self.lbl_buddy_pose.setWordWrap(True)
-        self.lbl_buddy_pose.setMinimumHeight(76)
+        self.lbl_buddy_pose.setFixedHeight(200)
         self.lbl_buddy_pose.setAlignment(Qt.AlignCenter)
+        self.lbl_buddy_pose.setScaledContents(False)
         v.addWidget(self.lbl_buddy_pose)
 
         self.lbl_buddy_bubble = QLabel("Ready when you are, operator.")
@@ -1119,7 +1200,9 @@ class WardriveGUI(QWidget):
         btn_summary.clicked.connect(self.open_any_latest_summary)
         btn_folder = QPushButton("Open Project Folder")
         btn_folder.clicked.connect(self.open_project_folder)
-        for b in (btn_project, btn_scan, btn_analyze, btn_summary, btn_folder):
+        btn_sync_dropbox = QPushButton("Sync to Dropbox")
+        btn_sync_dropbox.clicked.connect(self.sync_to_dropbox)
+        for b in (btn_project, btn_scan, btn_analyze, btn_summary, btn_folder, btn_sync_dropbox):
             action_row.addWidget(b)
         v.addLayout(action_row)
 
@@ -1305,6 +1388,242 @@ class WardriveGUI(QWidget):
         )
         v.addWidget(self.console_big, 1)
         return panel
+
+    # ── Intelligence Panel ────────────────────────────────────────────────
+
+    # Severity → (border-color, background-color, label-color)
+    _WIA_SEVERITY_STYLE: dict = {
+        "BOOT":    ("#00c8ff", "rgba(0,200,255,18)",  "#00c8ff"),
+        "INFO":    ("#7090a0", "rgba(100,130,150,15)", "#90b0c0"),
+        "NOTE":    ("#00e0c0", "rgba(0,220,190,18)",  "#00e0c0"),
+        "INSIGHT": ("#40e840", "rgba(40,220,40,18)",  "#40e840"),
+        "WARN":    ("#ffb020", "rgba(255,160,20,18)", "#ffb020"),
+        "ANOMALY": ("#ff6020", "rgba(255,80,20,18)",  "#ff6020"),
+        "SCORE":   ("#d060ff", "rgba(180,60,255,18)", "#d060ff"),
+    }
+
+    def _build_intelligence_tab(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("Panel")
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        # ── Header row ──────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        title = QLabel("WARDRIVE INTELLIGENCE ASSISTANT")
+        title.setObjectName("PanelTitle")
+        hdr.addWidget(title, 1)
+
+        self.lbl_wia_score = QLabel("QUALITY SCORE: —")
+        self.lbl_wia_score.setObjectName("StatChip")
+        self.lbl_wia_score.setStyleSheet(
+            "QLabel#StatChip { color: #d060ff; border: 1px solid #d060ff; "
+            "padding: 3px 10px; border-radius: 6px; }"
+        )
+        hdr.addWidget(self.lbl_wia_score)
+
+        btn_wia_clear = QPushButton("Clear Feed")
+        btn_wia_clear.setFixedWidth(90)
+        btn_wia_clear.clicked.connect(self._wia_clear)
+        hdr.addWidget(btn_wia_clear)
+        v.addLayout(hdr)
+
+        # ── Status / grade description ───────────────────────────────────
+        self.lbl_wia_status = QLabel(
+            "Run an analysis to populate the intelligence feed. "
+            "Cards are generated automatically when analysis completes."
+        )
+        self.lbl_wia_status.setObjectName("Notes")
+        self.lbl_wia_status.setWordWrap(True)
+        v.addWidget(self.lbl_wia_status)
+
+        # ── Card feed (rich-text QTextEdit) ──────────────────────────────
+        self.txt_wia_feed = QTextEdit()
+        self.txt_wia_feed.setReadOnly(True)
+        self.txt_wia_feed.setObjectName("WIAFeed")
+        self.txt_wia_feed.setAcceptRichText(True)
+        self.txt_wia_feed.setStyleSheet(
+            "QTextEdit#WIAFeed {"
+            "  background-color: rgba(0,0,0,180);"
+            "  color: #C8FFFA;"
+            "  font-family: Consolas, 'Courier New', monospace;"
+            "  font-size: 9pt;"
+            "  border: 1px solid rgba(0,255,220,80);"
+            "  border-radius: 10px;"
+            "}"
+        )
+        self.txt_wia_feed.document().setDefaultStyleSheet(
+            "p { margin:0; padding:0; } "
+            "h3 { margin:0; padding:0; } "
+            "ul { margin:0 0 0 14px; padding:0; }"
+        )
+        v.addWidget(self.txt_wia_feed, 1)
+
+        return panel
+
+    def _wia_clear(self) -> None:
+        """Clear the intelligence feed and score display."""
+        try:
+            self.txt_wia_feed.clear()
+            self.lbl_wia_score.setText("QUALITY SCORE: —")
+            self.lbl_wia_status.setText("Feed cleared. Run analysis to repopulate.")
+        except Exception:
+            pass
+
+    def _wia_render_card(self, card: dict) -> None:
+        """Append one card's HTML to the WIA feed (must be called from the main thread)."""
+        severity = card.get("severity", "INFO")
+        style    = self._WIA_SEVERITY_STYLE.get(severity, self._WIA_SEVERITY_STYLE["INFO"])
+        border_col, bg_col, label_col = style
+
+        title            = _safe_gui_text(card.get("title", ""), 120)
+        fact             = _safe_gui_text(card.get("fact", ""), 800)
+        interpretation   = _safe_gui_text(card.get("interpretation", ""), 600)
+        educational_note = _safe_gui_text(card.get("educational_note", ""), 600)
+        mascot_flavor    = _safe_gui_text(card.get("mascot_flavor", ""), 200)
+        recommendation   = _safe_gui_text(card.get("recommendation", ""), 400)
+        confidence       = _safe_gui_text(card.get("confidence", ""), 40)
+        timestamp        = _safe_gui_text(card.get("timestamp", ""), 12)
+
+        def nl2br(s: str) -> str:
+            return s.replace("\n", "<br/>")
+
+        html_parts = [
+            f'<div style="border-left:3px solid {border_col};'
+            f' background:{bg_col};'
+            f' margin:6px 0; padding:8px 12px; border-radius:4px;">',
+            f'<span style="color:{label_col}; font-weight:bold; font-size:10pt;">'
+            f'[{severity}] {title}</span>'
+            f'<span style="color:#606878; font-size:8pt;"> &nbsp;{timestamp} &nbsp;'
+            f'<em>{confidence}</em></span><br/>',
+            f'<span style="color:#b0c8d0;">{nl2br(fact)}</span>',
+        ]
+
+        if interpretation:
+            html_parts.append(
+                f'<br/><span style="color:#90c0b0;"><b>↳ </b>{nl2br(interpretation)}</span>'
+            )
+
+        if recommendation:
+            html_parts.append(
+                f'<br/><span style="color:#ffb020;"><b>→ </b>{nl2br(recommendation)}</span>'
+            )
+
+        if educational_note:
+            html_parts.append(
+                f'<br/><span style="color:#607080; font-style:italic;">'
+                f'[edu] {nl2br(educational_note)}</span>'
+            )
+
+        if mascot_flavor:
+            html_parts.append(
+                f'<br/><span style="color:#508878; font-style:italic;">'
+                f'» {nl2br(mascot_flavor)}</span>'
+            )
+
+        html_parts.append("</div>")
+
+        cursor = self.txt_wia_feed.textCursor()
+        cursor.movePosition(cursor.End)
+        self.txt_wia_feed.setTextCursor(cursor)
+        self.txt_wia_feed.insertHtml("".join(html_parts))
+
+        # Auto-scroll to bottom
+        sb = self.txt_wia_feed.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def _on_wia_card(self, card: dict) -> None:
+        """Slot: receive one InsightCard dict from WIAWorker and render it."""
+        try:
+            self._wia_render_card(card)
+        except Exception:
+            pass
+
+    def _on_wia_score(self, score: int, grade: str, summary: str) -> None:
+        """Slot: receive quality score from WIAWorker."""
+        try:
+            score_text = f"CAPTURE QUALITY: {score}/100 (Grade {grade})"
+            self.lbl_wia_score.setText(score_text)
+
+            color_map = {
+                "A": "#40e840", "B": "#90d050",
+                "C": "#ffb020", "D": "#ff8020", "F": "#ff4020",
+            }
+            col = color_map.get(grade, "#d060ff")
+            self.lbl_wia_score.setStyleSheet(
+                f"QLabel#StatChip {{ color: {col}; border: 1px solid {col}; "
+                "padding: 3px 10px; border-radius: 6px; }"
+            )
+            short_summary = summary[:120] + ("…" if len(summary) > 120 else "")
+            self.lbl_wia_status.setText(short_summary)
+        except Exception:
+            pass
+
+    def _on_wia_complete(self, total_cards: int) -> None:
+        """Slot: WIAWorker finished emitting all cards."""
+        try:
+            current = self.lbl_wia_status.text()
+            self.lbl_wia_status.setText(
+                current + f"  |  {total_cards} insight(s) generated."
+            )
+            self._log(f"[WIA] Intelligence feed populated: {total_cards} card(s).", "OK")
+            self._wia_worker = None
+        except Exception:
+            pass
+
+    def _start_wia_analysis(self, results: dict) -> None:
+        """Launch WIAWorker after analysis completes."""
+        csv_path = results.get("csv", "")
+        if not csv_path:
+            return
+        try:
+            import os as _os
+            if not _os.path.exists(csv_path):
+                return
+        except Exception:
+            return
+
+        try:
+            self._wia_clear()
+            self.lbl_wia_status.setText("Intelligence engine running…")
+
+            worker = WIAWorker(results)
+            self._wia_worker = worker
+            worker.card_ready.connect(self._on_wia_card)
+            worker.score_ready.connect(self._on_wia_score)
+            worker.finished_analysis.connect(self._on_wia_complete)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+        except Exception as exc:
+            self._log(f"[WIA] Could not start intelligence worker: {exc}", "WARN")
+
+    def _wia_emit_event(self, event_name: str, context: dict) -> None:
+        """Emit a WIA event card directly into the feed (synchronous, main thread)."""
+        try:
+            from assistant_engine import WIAEngine, WIAEvent
+            engine = WIAEngine()
+            try:
+                evt = WIAEvent(event_name)
+            except ValueError:
+                return
+            card = engine.on_event(evt, context)
+            if card is None:
+                return
+            self._wia_render_card({
+                "title":            card.title,
+                "fact":             card.fact,
+                "severity":         card.severity.value,
+                "confidence":       card.confidence.value,
+                "interpretation":   card.interpretation,
+                "educational_note": card.educational_note,
+                "mascot_flavor":    card.mascot_flavor,
+                "recommendation":   card.recommendation,
+                "timestamp":        card.timestamp,
+            })
+        except Exception:
+            pass
 
     def _console_clear(self):
         for attr in ("console_dock", "console_big"):
@@ -1734,6 +2053,25 @@ class WardriveGUI(QWidget):
         self.lbl_buddy_ai_status.setObjectName("Notes")
         v.addWidget(self.lbl_buddy_ai_status)
 
+        dropbox_title = QLabel("Dropbox Sync")
+        dropbox_title.setObjectName("PanelTitle")
+        v.addWidget(dropbox_title)
+
+        self.txt_dropbox_token = QLineEdit()
+        self.txt_dropbox_token.setEchoMode(QLineEdit.Password)
+        self.txt_dropbox_token.setPlaceholderText("Dropbox access token")
+        v.addWidget(self.txt_dropbox_token)
+
+        dropbox_path_row = QHBoxLayout()
+        dropbox_path_row.addWidget(QLabel("Dropbox folder path:"))
+        self.txt_dropbox_folder = QLineEdit("/WardriveAnalyzerSync")
+        dropbox_path_row.addWidget(self.txt_dropbox_folder)
+        v.addLayout(dropbox_path_row)
+
+        self.lbl_dropbox_help = QLabel("Setup: create a Dropbox app token and paste it here. Desktop uploads latest_project.zip; Android downloads it.")
+        self.lbl_dropbox_help.setObjectName("Notes")
+        v.addWidget(self.lbl_dropbox_help)
+
         btn_save = QPushButton("Save Settings")
         btn_save.clicked.connect(self._save_settings)
         btn_load = QPushButton("Load Settings")
@@ -1819,6 +2157,8 @@ class WardriveGUI(QWidget):
             set_setting(db, "buddy_ai_sanitize", "1" if self.chk_buddy_sanitize.isChecked() else "0")
             set_setting(db, "buddy_ai_base_url", self.txt_buddy_base_url.text().strip() or DEFAULT_BASE_URL)
             set_setting(db, "buddy_ai_model", self.txt_buddy_model.text().strip() or DEFAULT_MODEL)
+            set_setting(db, "dropbox_token", self.txt_dropbox_token.text().strip())
+            set_setting(db, "dropbox_folder", self.txt_dropbox_folder.text().strip() or "/WardriveAnalyzerSync")
             token = self.txt_buddy_api_token.text().strip()
             if token and save_token_to_keyring(self.project_dir, token):
                 set_setting(db, "buddy_ai_token", "")
@@ -1853,6 +2193,8 @@ class WardriveGUI(QWidget):
             self.chk_buddy_sanitize.setChecked(True)
             self.txt_buddy_base_url.setText(get_setting(db, "buddy_ai_base_url", DEFAULT_BASE_URL) or DEFAULT_BASE_URL)
             self.txt_buddy_model.setText(get_setting(db, "buddy_ai_model", DEFAULT_MODEL) or DEFAULT_MODEL)
+            self.txt_dropbox_token.setText(get_setting(db, "dropbox_token", ""))
+            self.txt_dropbox_folder.setText(get_setting(db, "dropbox_folder", "/WardriveAnalyzerSync") or "/WardriveAnalyzerSync")
             token_store = get_setting(db, "buddy_ai_token_store", "")
             token = load_token_from_keyring(self.project_dir) if token_store == "keyring" else ""
             if not token:
@@ -1862,6 +2204,32 @@ class WardriveGUI(QWidget):
             self._log("Settings loaded.")
         except Exception:
             pass
+
+    def sync_to_dropbox(self) -> None:
+        if not self.project_dir:
+            QMessageBox.warning(self, "Missing Project", "Select a Project Folder first.")
+            return
+        token = self.txt_dropbox_token.text().strip() if hasattr(self, "txt_dropbox_token") else ""
+        folder = self.txt_dropbox_folder.text().strip() if hasattr(self, "txt_dropbox_folder") else "/WardriveAnalyzerSync"
+        if not token:
+            QMessageBox.information(
+                self,
+                "Dropbox Setup",
+                "Open Settings -> Dropbox Sync, paste your Dropbox access token, then click Save Settings."
+            )
+            self.tabs.setCurrentWidget(self.tab_settings)
+            return
+        try:
+            self._log("Starting Dropbox sync for current project...")
+            result = sync_project_to_dropbox(self.project_dir, token, folder)
+            self._log(f"Dropbox sync complete: {result.get('remote_latest')}")
+            QMessageBox.information(
+                self,
+                "Dropbox Sync Complete",
+                f"Uploaded project snapshot to Dropbox.\n\nFolder: {result.get('remote_folder')}\nLatest file: {result.get('remote_latest')}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Dropbox Sync Error", str(e))
 
     def _build_footer(self) -> QWidget:
         frame = QFrame()
@@ -2197,7 +2565,56 @@ class WardriveGUI(QWidget):
     def _tick_buddy(self) -> None:
         try:
             render = self.mascot.tick()
-            self.lbl_buddy_pose.setText(render.frame_text)
+
+            # --- Sprite display ---
+            png_name = self._MASCOT_PNG.get(render.pose_id, "start.png")
+            if png_name not in self._mascot_pixmap_cache:
+                pix_path = resource_path("assets", "mascot", png_name)
+                loaded = QPixmap(pix_path)
+                self._mascot_pixmap_cache[png_name] = loaded
+
+            src_pix = self._mascot_pixmap_cache.get(png_name, QPixmap())
+
+            if not src_pix.isNull():
+                label_w = max(self.lbl_buddy_pose.width(), 220)
+                label_h = self.lbl_buddy_pose.height() or 200
+
+                # Scale to fit panel, preserving aspect ratio
+                scaled = src_pix.scaledToWidth(min(label_w - 8, 210), Qt.SmoothTransformation)
+                if scaled.height() > label_h - 8:
+                    scaled = scaled.scaledToHeight(label_h - 8, Qt.SmoothTransformation)
+
+                # Bob: sine wave ±4px
+                self._mascot_bob_phase = (self._mascot_bob_phase + 0.12) % (2 * math.pi)
+                bob_y = int(math.sin(self._mascot_bob_phase) * 4)
+
+                # Scanline alpha: pulse during ANALYZING
+                if render.pose_id == "POSE_ANALYZING":
+                    scan_alpha = int((0.12 + 0.08 * abs(math.sin(self._mascot_bob_phase * 2.5))) * 255)
+                else:
+                    scan_alpha = int(0.15 * 255)
+
+                # Compose into canvas
+                canvas = QPixmap(label_w, label_h)
+                canvas.fill(QColor(0, 0, 0, 0))
+                painter = QPainter(canvas)
+                x_off = (label_w - scaled.width()) // 2
+                y_off = (label_h - scaled.height()) // 2 + bob_y
+                painter.drawPixmap(x_off, y_off, scaled)
+
+                # VGA scanlines overlay
+                painter.setRenderHint(QPainter.Antialiasing, False)
+                scan_pen = QPen(QColor(0, 0, 0, scan_alpha), 1)
+                painter.setPen(scan_pen)
+                for sl_y in range(0, label_h, 2):
+                    painter.drawLine(0, sl_y, label_w, sl_y)
+                painter.end()
+
+                self.lbl_buddy_pose.setPixmap(canvas)
+            else:
+                # PNG missing — fall back to text
+                self.lbl_buddy_pose.setText(render.frame_text)
+
             if time.time() >= getattr(self, "_buddy_override_until", 0.0):
                 self.lbl_buddy_bubble.setText(render.bubble_text)
         except Exception:
@@ -2582,6 +2999,7 @@ class WardriveGUI(QWidget):
             self.refresh_mission_control()
             self._update_onboarding_checklist()
             self._buddy_say("Project locked. I can summarize runs, inspect evidence health, or suggest the next move.")
+            self._wia_emit_event("project_selected", {"path": folder})
 
     def open_last_summary(self):
         p = getattr(self, "_project_last_summary", None)
@@ -2651,6 +3069,7 @@ class WardriveGUI(QWidget):
         if added:
             self._log(f"Loaded {added} log(s).")
             self._set_buddy_state(MascotState.LOGS_ADDED)
+            self._wia_emit_event("logs_added", {"count": added})
         if skipped:
             self._log(f"Duplicate logs skipped: {skipped} (fingerprint match)")
 
@@ -2682,6 +3101,7 @@ class WardriveGUI(QWidget):
         if added:
             self._log(f"Loaded {added} PCAP(s).")
             self._set_buddy_state(MascotState.PCAPS_ADDED)
+            self._wia_emit_event("pcaps_added", {"count": added})
         if skipped:
             self._log(f"Duplicate PCAPs skipped: {skipped} (fingerprint match)")
 
@@ -2908,6 +3328,15 @@ class WardriveGUI(QWidget):
                 except Exception:
                     pass
         self.refresh_mission_control()
+
+        # Launch WIA intelligence engine in background
+        try:
+            self._start_wia_analysis(results)
+            # Switch to the Intelligence tab so the user sees cards populating
+            if hasattr(self, "tab_intelligence"):
+                self.tabs.setCurrentWidget(self.tab_intelligence)
+        except Exception:
+            pass
 
         # Auto-open: prefer summary.html if available, else open the run folder
         if self.chk_auto_open.isChecked():
@@ -3318,6 +3747,12 @@ class WardriveGUI(QWidget):
         )
         self.refresh_mission_control()
         QMessageBox.information(self, "Ingest Complete", summary)
+
+        # WIA event
+        self._wia_emit_event("ingest_done", {
+            "imported": stats.get("imported", 0),
+            "duplicates": stats.get("duplicates", 0),
+        })
 
         try:
             resp = QMessageBox.question(
