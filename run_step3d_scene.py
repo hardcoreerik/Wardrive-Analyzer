@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 from PySide6.QtWidgets import QApplication
+from check_deps import validate_or_exit
 from error_logger import install_global_error_hooks, write_error_report
 from gui_step3d_scene import WardriveGUI
 
@@ -30,6 +31,7 @@ def load_stylesheet():
     return ""
 
 def main():
+    validate_or_exit()
     log_path = setup_logging()
     try:
         install_global_error_hooks(os.getcwd())

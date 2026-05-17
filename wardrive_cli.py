@@ -61,6 +61,16 @@ def _cmd_scan_folder(args: argparse.Namespace) -> dict[str, Any]:
     return svc.scan_folder(args.folder, limit=args.limit, include_hidden=args.include_hidden)
 
 
+def _cmd_scrub_project(args: argparse.Namespace) -> dict[str, Any]:
+    return svc.scrub_project(
+        args.project,
+        output_dir=getattr(args, "output_dir", None),
+        fuzz_gps=getattr(args, "fuzz_gps", False),
+        remove_stations=getattr(args, "remove_stations", False),
+        remove_pcaps=getattr(args, "remove_pcaps", False),
+    )
+
+
 def _cmd_analyze_project(args: argparse.Namespace) -> dict[str, Any]:
     def event(message: str) -> None:
         if args.events:
@@ -94,6 +104,14 @@ def _dispatch_action(action: str, params: dict[str, Any]) -> dict[str, Any]:
         return svc.scan_folder(str(params["folder"]), limit=int(params.get("limit", 250)), include_hidden=bool(params.get("include_hidden", False)))
     if action == "analyze_project":
         return svc.analyze_project(str(params["project"]))
+    if action == "scrub_project":
+        return svc.scrub_project(
+            str(params["project"]),
+            output_dir=params.get("output_dir"),
+            fuzz_gps=bool(params.get("fuzz_gps", False)),
+            remove_stations=bool(params.get("remove_stations", False)),
+            remove_pcaps=bool(params.get("remove_pcaps", False)),
+        )
     return svc.result("error", error=f"Unknown action: {action}")
 
 
@@ -193,6 +211,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project")
     p.add_argument("--events", action="store_true", help="Stream progress events as JSON lines to stderr.")
     p.set_defaults(func=_cmd_analyze_project)
+
+    p = sub.add_parser("scrub-project", help="Copy a project with tokens redacted and evidence optionally sanitized.")
+    p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("project")
+    p.add_argument("--output-dir", dest="output_dir", default=None, help="Destination directory for scrubbed copy.")
+    p.add_argument("--fuzz-gps", dest="fuzz_gps", action="store_true", help="Add small random offset to GPS coordinates.")
+    p.add_argument("--remove-stations", dest="remove_stations", action="store_true", help="Remove station-only rows from CSVs.")
+    p.add_argument("--remove-pcaps", dest="remove_pcaps", action="store_true", help="Delete PCAP files from the scrubbed copy.")
+    p.set_defaults(func=_cmd_scrub_project)
 
     p = sub.add_parser("serve-stdio", help="Run a local JSONL stdio bridge for agents.")
     p.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)

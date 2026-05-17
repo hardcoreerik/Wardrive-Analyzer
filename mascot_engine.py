@@ -91,6 +91,10 @@ class MascotEngine:
             "you're so good at everything you do… I’m gonna need a bigger ego to keep up.",
             "you're so good at everything you do… please leave some competence for the rest of us.",
             "you're so good at everything you do… alright, show-off.",
+            "you're so good at everything you do… my motivational speech got cancelled.",
+            "you're so good at everything you do… statistically this should be impossible.",
+            "you're so good at everything you do… I checked twice. Still annoying.",
+            "you're so good at everything you do… I am both proud and offended.",
         ]
 
     def _build_step_comments(self) -> Dict[MascotState, List[str]]:
@@ -101,6 +105,11 @@ class MascotEngine:
                 "We’re idle. That’s either good… or you fell asleep.",
                 "Drop the evidence. I’ll do the judging.",
                 "Ready when you are, operator.",
+                "Console awake. Systems nominal. Drama optional.",
+                "Standing by for input. Pretending patience.",
+                "This dashboard is quiet. I distrust quiet.",
+                "If you blink too long, I call it strategic delay.",
+                "I brought sarcasm and buffer space. Let’s go.",
             ],
             MascotState.LOGS_ADDED: [
                 "Logs loaded. GPS footprints acquired.",
@@ -108,6 +117,11 @@ class MascotEngine:
                 "I see where you’ve been. Spooky.",
                 "Logs look tasty. Add PCAPs for the full meal.",
                 "Not bad. You’re assembling evidence like a pro.",
+                "Route history imported. Breadcrumbs look sharp.",
+                "Coordinates are lining up. Keep feeding me data.",
+                "Log ingest clean. Timeline is starting to breathe.",
+                "GPS evidence online. The map has opinions now.",
+                "Good trail density. This could get precise fast.",
             ],
             MascotState.PCAPS_ADDED: [
                 "PCAPs loaded. Packets are whispering.",
@@ -115,6 +129,11 @@ class MascotEngine:
                 "Good. Now we can cross-check the story.",
                 "PCAPs in the bag. Want logs too?",
                 "This is the fun part. Don’t blink.",
+                "Frame harvest complete. Spectrum gossip acquired.",
+                "RF intake looks healthy. Correlation potential rising.",
+                "Packets parsed without drama. Rare and beautiful.",
+                "Capture set accepted. Time to triangulate truth.",
+                "PCAP payload secured. Let’s make it confess.",
             ],
             MascotState.FOLDER_SELECTED: [
                 "Project folder locked. No overwrites. No tears.",
@@ -122,6 +141,11 @@ class MascotEngine:
                 "Alright… everything goes in its proper vault.",
                 "Folder selected. Your future self says thanks.",
                 "Perfect. Now hit Analyze and pretend it’s not exciting.",
+                "Vault path validated. Evidence has a home now.",
+                "Storage target armed. We do clean chain-of-custody here.",
+                "Folder is live. Your reports know where to land.",
+                "Good housekeeping. That prevents 3 AM regret.",
+                "Workspace anchored. Proceed when ready.",
             ],
             MascotState.ANALYZING: [
                 "Engines lit. Parsing evidence now.",
@@ -129,6 +153,11 @@ class MascotEngine:
                 "Working… and yes, I’m judging your signal quality.",
                 "Processing. Try not to stare at the progress bar too hard.",
                 "We’re cooking. Smells like correlation.",
+                "Analysis thread engaged. Hold your applause.",
+                "Correlating logs to packets. This is where truth hardens.",
+                "Number-crunch cycle active. Let the models eat.",
+                "Indexing evidence artifacts. Precision incoming.",
+                "Pipeline humming. Keep calm and trust the parse.",
             ],
             MascotState.DONE: [
                 "Mission complete. Reports are in the vault.",
@@ -136,6 +165,11 @@ class MascotEngine:
                 "Artifacts generated. Go admire your evidence.",
                 "Complete. Now go open that summary like a champion.",
                 "We’re finished. Try not to get addicted to clean data.",
+                "Cycle complete. Exports are waiting for your verdict.",
+                "All outputs written. Nothing exploded. Historic moment.",
+                "Analysis wrapped. Debrief yourself with the reports.",
+                "Deliverables ready. You may now look smug.",
+                "Run closed clean. Evidence story is on disk.",
             ],
             MascotState.ERROR: [
                 "Bzzzt. We hit an error. Don’t panic—yet.",
@@ -143,12 +177,15 @@ class MascotEngine:
                 "Something broke. It was probably the universe, not you.",
                 "Error state. I’ll act surprised: 😐",
                 "Well… that wasn’t supposed to happen. But here we are.",
+                "Fault detected. Grab logs before we blame ghosts.",
+                "Pipeline tripped. We debug, therefore we continue.",
+                "Exception intercepted. Keep breathing and read the traceback.",
+                "That step failed with confidence. Let’s inspect it.",
+                "Unplanned behavior observed. Diagnostics time.",
             ],
         }
 
     def _build_idle_comments(self) -> Dict[MascotState, List[str]]:
-        # 40 per state is a lot of writing; we use a shared waiting pool but make it state-aware.
-        # Each state gets its own 40 built from templates so they stay relevant to "waiting in this step".
         base = [
             "Still with me, or did you alt-tab into the void?",
             "I can wait. I’ve got… unlimited patience. Allegedly.",
@@ -191,9 +228,50 @@ class MascotEngine:
             "Okay. I’m still here. Obviously.",
             "Let’s move. The night is young and the data is messy.",
         ]
-        # Ensure 40 exactly
-        base = base[:40]
-        return {s: base[:] for s in MascotState}
+
+        state_openers: Dict[MascotState, List[str]] = {
+            MascotState.START: [
+                "Startup lane is warm. Throw me logs or PCAPs.",
+                "We are in ready-state limbo. Your move, operator.",
+                "Start screen serenity. It won’t last.",
+            ],
+            MascotState.LOGS_ADDED: [
+                "Logs are queued. Packet evidence would complete the picture.",
+                "GPS side is ready; waiting on radio side.",
+                "Map trail is loaded. We can go deeper.",
+            ],
+            MascotState.PCAPS_ADDED: [
+                "Packet stack loaded. Add logs for stronger attribution.",
+                "RF evidence is primed. Coordinates would sharpen it.",
+                "The air has spoken; now we need the route.",
+            ],
+            MascotState.FOLDER_SELECTED: [
+                "Vault target is set. We can safely run analysis.",
+                "Folder is ready. One click from action.",
+                "Storage path secured. Waiting for launch.",
+            ],
+            MascotState.ANALYZING: [
+                "Analysis is active. Progress takes the time it takes.",
+                "Engines are still chewing. Resist the urge to poke.",
+                "Parser cadence steady. Let it finish clean.",
+            ],
+            MascotState.DONE: [
+                "Run is complete. Reports are waiting on you.",
+                "Finished state detected. Debrief is the next move.",
+                "Nothing left to process. Review and export if needed.",
+            ],
+            MascotState.ERROR: [
+                "We are paused on an error. Console first, panic second.",
+                "Failure latched. Gather clues, then retry.",
+                "Error state still active. Diagnostics beat guessing.",
+            ],
+        }
+
+        comments: Dict[MascotState, List[str]] = {}
+        for state in MascotState:
+            lines = state_openers.get(state, []) + base
+            comments[state] = lines
+        return comments
 
     # -------- frames (placeholder) --------
 

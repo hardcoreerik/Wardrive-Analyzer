@@ -1311,3 +1311,425 @@ applyFilters();
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Tab5 JSON Export — 7 artifact files for WARDRIVE Field Terminal (ESP32-P4)
+# Uses existing _auth_bucket() defined above.
+# ---------------------------------------------------------------------------
+
+def _risk_label(score) -> str:
+    try:
+        r = float(score)
+    except (TypeError, ValueError):
+        return "unknown"
+    if r >= 8: return "critical"
+    if r >= 6: return "high"
+    if r >= 4: return "medium"
+    if r >= 2: return "low"
+    return "info"
+
+
+def _tab5_session_summary(centroids: List[dict], stats: dict, run_id: str) -> dict:
+    from collections import Counter as _Counter
+
+    network_count   = len(centroids)
+    handshakes_seen = sum(1 for c in centroids if str(c.get("HandshakeSeen", "")).lower() == "yes")
+    eapol_total     = sum(int(c.get("EAPOLFrames", 0) or 0) for c in centroids)
+
+    channels = []
+    for c in centroids:
+        try: channels.append(int(c.get("Channel")))
+        except (TypeError, ValueError): pass
+    channels_active = sorted(set(channels))
+
+    auth_counts = _Counter(_auth_bucket(c.get("AuthMode", "")) for c in centroids)
+
+    risk_vals = []
+    for c in centroids:
+        try: risk_vals.append(float(c.get("RiskScore", 0) or 0))
+        except (TypeError, ValueError): pass
+    risk_avg = round(sum(risk_vals) / len(risk_vals), 2) if risk_vals else 0.0
+    risk_max = round(max(risk_vals), 2) if risk_vals else 0.0
+
+    located = [c for c in centroids if c.get("CentroidLat") not in (NO_DATA, "", None)]
+    if located:
+        centroid_lat = round(sum(float(c["CentroidLat"]) for c in located) / len(located), 6)
+        centroid_lon = round(sum(float(c["CentroidLon"]) for c in located) / len(located), 6)
+    else:
+        centroid_lat = centroid_lon = None
+
+    return {
+        "schema_version":      1,
+        "run_id":              run_id,
+        "created":             now_str(),
+        "network_count":       network_count,
+        "handshakes_seen":     handshakes_seen,
+        "eapol_frames_total":  eapol_total,
+        "channels_active":     channels_active,
+        "top_auth_modes":      dict(auth_counts.most_common()),
+        "risk_score_avg":      risk_avg,
+        "risk_score_max":      risk_max,
+        "centroid_lat":        centroid_lat,
+        "centroid_lon":        centroid_lon,
+        "wardrive_master_csv": "wardrive_master.csv",
+    }
+
+
+def _tab5_capture_quality(centroids: List[dict], stats: dict) -> dict:
+    network_count = len(centroids)
+    pcap_count    = stats.get("pcap_unique", 0)
+    log_count     = stats.get("log_unique", 0)
+    eapol_aps     = sum(1 for c in centroids if int(c.get("EAPOLFrames", 0) or 0) > 0)
+    full_hs       = sum(1 for c in centroids
+                        if str(c.get("HandshakeSeen", "")).lower() == "yes"
+                        and str(c.get("HandshakeConfidence", "")).upper() not in ("NONE", "EAPOL", ""))
+
+    beacon_coverage    = min(1.0, round(pcap_count / log_count, 3) if log_count else 0.0)
+    eapol_completeness = round(full_hs / eapol_aps, 3) if eapol_aps else 0.0
+    file_score         = min(30, (stats.get("multi_file_aps", 0) / max(network_count, 1)) * 30)
+    score              = max(0, min(100, int(beacon_coverage * 40 + eapol_completeness * 30 + file_score)))
+
+    grade = "A" if score >= 90 else "B+" if score >= 80 else "B" if score >= 70 \
+            else "C+" if score >= 60 else "C" if score >= 50 else "D"
+
+    notes = []
+    if full_hs > 0:
+        notes.append(f"{full_hs} complete EAPOL handshake(s) captured")
+    if beacon_coverage >= 0.85:
+        notes.append("High beacon/log coverage — thorough wardrive")
+    elif beacon_coverage < 0.40:
+        notes.append("Low beacon/log overlap — consider additional PCAP passes")
+    if eapol_aps > 0 and eapol_completeness < 0.5:
+        notes.append("EAPOL frames seen but few complete handshakes — normal for passive capture")
+    if stats.get("multi_day_aps", 0) > 0:
+        notes.append(f"{stats['multi_day_aps']} AP(s) seen across multiple drive sessions")
+
+    return {
+        "schema_version":      1,
+        "overall_score":       score,
+        "grade":               grade,
+        "beacon_coverage":     beacon_coverage,
+        "eapol_completeness":  eapol_completeness,
+        "eapol_aps_seen":      eapol_aps,
+        "complete_handshakes": full_hs,
+        "log_unique_networks": stats.get("log_unique", 0),
+        "pcap_unique_networks": pcap_count,
+        "multi_file_aps":      stats.get("multi_file_aps", 0),
+        "multi_day_aps":       stats.get("multi_day_aps", 0),
+        "notes":               notes,
+    }
+
+
+def _tab5_assistant_cards(centroids: List[dict]) -> List[dict]:
+    from collections import Counter as _Counter
+    cards  = []
+    cid    = [0]
+
+    def _card(title, body, team, severity):
+        cid[0] += 1
+        return {"id": f"card_{cid[0]:03d}", "title": title, "body": body,
+                "team": team, "severity": severity}
+
+    open_nets = [c for c in centroids if _auth_bucket(c.get("AuthMode", "")) == "Open"]
+    if open_nets:
+        strong = [c for c in open_nets
+                  if c.get("BestRSSI") not in (NO_DATA, "", None)
+                  and float(c.get("BestRSSI", 0) or -999) > -70]
+        cards.append(_card(
+            f"{len(open_nets)} Open Network(s) Detected",
+            f"{len(open_nets)} unencrypted network(s) observed. "
+            f"{len(strong)} with strong signal (RSSI > -70 dBm). "
+            "Open networks expose all traffic to passive capture.",
+            "blue", "medium" if len(open_nets) > 3 else "low"))
+
+    wep_nets = [c for c in centroids if _auth_bucket(c.get("AuthMode", "")) == "WEP"]
+    if wep_nets:
+        cards.append(_card(
+            f"Obsolete WEP Encryption — {len(wep_nets)} AP(s)",
+            f"{len(wep_nets)} AP(s) using WEP, deprecated since 2004.",
+            "blue", "high"))
+
+    hs_nets = [c for c in centroids if str(c.get("HandshakeSeen", "")).lower() == "yes"]
+    if hs_nets:
+        full_hs = [c for c in hs_nets
+                   if str(c.get("HandshakeConfidence", "")).upper() not in ("NONE", "EAPOL", "")]
+        cards.append(_card(
+            f"EAPOL Handshake Frames — {len(hs_nets)} AP(s)",
+            f"EAPOL activity for {len(hs_nets)} AP(s). "
+            f"{len(full_hs)} appear to have complete 4-way handshakes.",
+            "red", "medium"))
+
+    high_risk = [c for c in centroids if float(c.get("RiskScore", 0) or 0) >= 7.0]
+    if high_risk:
+        top   = sorted(high_risk, key=lambda c: float(c.get("RiskScore", 0) or 0), reverse=True)[:3]
+        ssids = ", ".join(str(c.get("TopSSID", "?"))[:24] for c in top)
+        cards.append(_card(
+            f"{len(high_risk)} High-Risk Network(s)",
+            f"{len(high_risk)} networks scored 7.0+. Top: {ssids}.",
+            "blue", "high"))
+
+    hidden = [c for c in centroids
+              if c.get("TopSSID") in (NO_DATA, "", None)
+              and str(c.get("SeenInPCAP", "")).lower() == "yes"]
+    if hidden:
+        cards.append(_card(
+            f"{len(hidden)} Hidden SSID(s)",
+            f"{len(hidden)} BSSID(s) with null SSID visible in PCAP. "
+            "Hidden SSIDs are trivially revealed by passive probe capture.",
+            "purple", "low"))
+
+    multi_day = [c for c in centroids if str(c.get("MultiDaySeen", "")).lower() == "yes"]
+    if multi_day:
+        cards.append(_card(
+            f"{len(multi_day)} Persistent AP(s) — Multi-Session",
+            f"{len(multi_day)} AP(s) observed across multiple wardrive sessions.",
+            "purple", "info"))
+
+    auth_ctr = _Counter(_auth_bucket(c.get("AuthMode", "")) for c in centroids)
+    if auth_ctr.get("WPA3", 0) > 0:
+        pct = round(auth_ctr["WPA3"] / len(centroids) * 100)
+        cards.append(_card(
+            f"WPA3 Adoption — {pct}% of Networks",
+            f"{auth_ctr['WPA3']} of {len(centroids)} networks use WPA3.",
+            "blue", "info"))
+
+    channels = []
+    for c in centroids:
+        try: channels.append(int(c.get("Channel", "0") or 0))
+        except: pass
+    ch_5ghz = sorted(set(ch for ch in channels if ch > 14))
+    if ch_5ghz:
+        cards.append(_card(
+            f"5 GHz Activity — {len(ch_5ghz)} Channel(s)",
+            f"5 GHz channels detected: {ch_5ghz}.",
+            "general", "info"))
+
+    return cards
+
+
+def _tab5_blue_team(centroids: List[dict], stats: dict) -> List[dict]:
+    findings   = []
+    open_count = sum(1 for c in centroids if _auth_bucket(c.get("AuthMode", "")) == "Open")
+    wep_count  = sum(1 for c in centroids if _auth_bucket(c.get("AuthMode", "")) == "WEP")
+    wpa_count  = sum(1 for c in centroids if _auth_bucket(c.get("AuthMode", "")) in ("WPA", "WPA2", "WPA3"))
+    total      = len(centroids)
+
+    findings.append({
+        "title":    "Network Encryption Posture",
+        "detail":   f"Scanned area: {total} unique networks. "
+                    f"Encrypted (WPA*): {wpa_count} ({round(wpa_count / total * 100) if total else 0}%). "
+                    f"Open: {open_count}. WEP (obsolete): {wep_count}.",
+        "action":   ("Flag open and WEP networks as priority targets for remediation."
+                     if (open_count + wep_count) > 0
+                     else "Encryption posture is acceptable for the observed area."),
+        "severity": "high" if (open_count + wep_count) > 5 else "medium" if (open_count + wep_count) > 0 else "info",
+    })
+
+    accessible_open = [c for c in centroids
+                       if _auth_bucket(c.get("AuthMode", "")) == "Open"
+                       and c.get("BestRSSI") not in (NO_DATA, "", None)
+                       and float(c.get("BestRSSI", -999) or -999) > -65]
+    if accessible_open:
+        findings.append({
+            "title":    f"{len(accessible_open)} Open Network(s) with Strong Signal",
+            "detail":   "Open networks with RSSI > -65 dBm are accessible from public areas.",
+            "action":   "Verify whether intentional guest networks or misconfigured APs.",
+            "severity": "high",
+        })
+
+    high_q = stats.get("high_quality_locations", 0)
+    med_q  = stats.get("medium_quality_locations", 0)
+    if high_q + med_q > 0:
+        findings.append({
+            "title":    "Location Data Quality",
+            "detail":   f"{high_q} high-confidence and {med_q} medium-confidence centroid locations.",
+            "action":   "Use wardrive_map.kml for GIS overlay with facility floor plans.",
+            "severity": "info",
+        })
+
+    return findings
+
+
+def _tab5_red_team(centroids: List[dict]) -> List[dict]:
+    """Evidence triage only — no exploit instructions, no cracking steps."""
+    obs       = []
+    eapol_aps = [c for c in centroids if int(c.get("EAPOLFrames", 0) or 0) > 0]
+    complete  = [c for c in eapol_aps
+                 if str(c.get("HandshakeConfidence", "")).upper() not in ("NONE", "EAPOL", "")]
+
+    obs.append({
+        "title":            "EAPOL Capture Assessment",
+        "detail":           f"{len(eapol_aps)} AP(s) with EAPOL frames. "
+                            f"{len(complete)} with high-confidence handshake frames.",
+        "evidence_quality": "high" if len(complete) >= 3 else "medium" if len(complete) >= 1 else "low",
+        "note":             "Evidence quality for authorized assessment use only.",
+    })
+
+    high_risk = [c for c in centroids if float(c.get("RiskScore", 0) or 0) >= 7.0]
+    obs.append({
+        "title":            "Scope-Relevant Target Density",
+        "detail":           f"{len(high_risk)} of {len(centroids)} networks scored 7.0+ risk.",
+        "evidence_quality": "high" if len(high_risk) > 0 else "info",
+        "note":             "All assessment activities require explicit written authorization.",
+    })
+
+    pcap_aps = [c for c in centroids if str(c.get("SeenInPCAP", "")).lower() == "yes"]
+    obs.append({
+        "title":            "PCAP Evidence Inventory",
+        "detail":           f"{len(pcap_aps)} of {len(centroids)} networks appear in PCAP captures.",
+        "evidence_quality": "high" if len(pcap_aps) > 10 else "medium",
+        "note":             "Review pcap_bssid_master.csv for per-PCAP breakdown.",
+    })
+
+    persistent = [c for c in centroids if str(c.get("MultiDaySeen", "")).lower() == "yes"]
+    if persistent:
+        obs.append({
+            "title":            f"Persistent Infrastructure — {len(persistent)} AP(s)",
+            "detail":           f"{len(persistent)} AP(s) confirmed across multiple capture sessions.",
+            "evidence_quality": "high",
+            "note":             "Persistent APs represent fixed infrastructure.",
+        })
+
+    return obs
+
+
+def _tab5_purple_team(centroids: List[dict]) -> List[dict]:
+    lessons   = []
+    eapol_aps = sum(1 for c in centroids if int(c.get("EAPOLFrames", 0) or 0) > 0)
+
+    if eapol_aps > 0:
+        lessons.append({
+            "title":         "EAPOL 4-Way Handshake — Observed in Capture",
+            "concept":       "The 802.11i 4-way handshake establishes the PTK between client and AP. "
+                             "Capturing all 4 frames is needed for offline key derivation testing.",
+            "observed":      f"EAPOL frames seen from {eapol_aps} AP(s) in this wardrive.",
+            "detection_tip": "IDS/WIPS can alert on unusual EAPOL rates or deauth-then-reassociation.",
+        })
+
+    open_count = sum(1 for c in centroids if _auth_bucket(c.get("AuthMode", "")) == "Open")
+    if open_count > 0:
+        lessons.append({
+            "title":         "Open Network Traffic Exposure",
+            "concept":       "Open 802.11 networks transmit all frames unencrypted at Layer 2. "
+                             "Any receiver in RF range can decode without association.",
+            "observed":      f"{open_count} open network(s) in this scan area.",
+            "detection_tip": "Client-side VPN or 802.1X required on open networks.",
+        })
+
+    ch_set = set()
+    for c in centroids:
+        try: ch_set.add(int(c.get("Channel", "0") or 0))
+        except: pass
+    if ch_set:
+        lessons.append({
+            "title":         "Channel Distribution Analysis",
+            "concept":       "2.4 GHz non-overlapping channels: 1, 6, 11. 5 GHz: channels 36-165.",
+            "observed":      f"Channels in this scan: {sorted(ch_set)}.",
+            "detection_tip": "Full-spectrum capture requires dedicated multi-radio hardware.",
+        })
+
+    hidden = sum(1 for c in centroids
+                 if c.get("TopSSID") in (NO_DATA, "", None)
+                 and str(c.get("SeenInPCAP", "")).lower() == "yes")
+    if hidden > 0:
+        lessons.append({
+            "title":         "Hidden SSID Security Theater",
+            "concept":       "Suppressed SSIDs are revealed in probe responses and association requests.",
+            "observed":      f"{hidden} BSSID(s) with null SSID visible in capture.",
+            "detection_tip": "Correlate beacon MAC with probe-response frames to reveal hidden SSIDs.",
+        })
+
+    return lessons
+
+
+def _tab5_education_cards(centroids: List[dict]) -> List[dict]:
+    cards       = []
+    auth_buckets = set(_auth_bucket(c.get("AuthMode", "")) for c in centroids)
+
+    if "WEP" in auth_buckets:
+        cards.append({
+            "id": "edu_wep", "title": "What is WEP?",
+            "body": "Wired Equivalent Privacy (WEP) is a deprecated 802.11 protocol broken in 2001. "
+                    "RC4 with weak IVs allows passive key recovery in minutes. Replaced by WPA in 2003.",
+            "tags": ["protocol", "encryption", "history"],
+        })
+
+    if any(int(c.get("EAPOLFrames", 0) or 0) > 0 for c in centroids):
+        cards.append({
+            "id": "edu_eapol", "title": "What is EAPOL?",
+            "body": "EAPOL frames carry the 802.11i 4-way handshake. "
+                    "The handshake derives the PTK from PSK + ANonce + SNonce. "
+                    "Frames 1+2 are sufficient for offline PTK computation.",
+            "tags": ["protocol", "authentication", "802.11i"],
+        })
+
+    if "Open" in auth_buckets:
+        cards.append({
+            "id": "edu_open", "title": "Open Network Risks",
+            "body": "Open 802.11 networks have no authentication or encryption. "
+                    "OWE (Opportunistic Wireless Encryption) adds encryption without auth "
+                    "but is rarely deployed.",
+            "tags": ["protocol", "encryption", "risk"],
+        })
+
+    cards.append({
+        "id": "edu_rssi", "title": "Understanding RSSI",
+        "body": "RSSI in dBm (negative): -30 excellent, -67 reliable, -80 weak, -90 unreliable. "
+                "Centroid accuracy improves with sightings above -80 dBm.",
+        "tags": ["rf", "measurement", "basics"],
+    })
+
+    cards.append({
+        "id": "edu_centroid", "title": "How Centroids Are Computed",
+        "body": "Weighted centroid per BSSID using GPS + RSSI-weighted sightings. "
+                "Confidence radius reflects sighting spread.",
+        "tags": ["gps", "geometry", "analysis"],
+    })
+
+    if "WPA3" in auth_buckets:
+        cards.append({
+            "id": "edu_wpa3", "title": "WPA3 Improvements",
+            "body": "WPA3 uses SAE (Simultaneous Authentication of Equals), providing forward secrecy. "
+                    "Captured handshakes cannot decrypt past sessions even with the passphrase.",
+            "tags": ["protocol", "encryption", "wpa3"],
+        })
+
+    return cards
+
+
+def write_tab5_json_export(
+    centroids: List[dict],
+    stats: dict,
+    run_id: str,
+    outdir: str,
+) -> dict:
+    """
+    Generate 7 JSON artifact files for the WARDRIVE Field Terminal (ESP32-P4 Tab5).
+    Written to outdir alongside wardrive_master.csv.
+    Returns a dict of artifact keys → absolute file paths.
+    """
+    import json as _json
+
+    def _dump(obj, filename):
+        path = os.path.join(outdir, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(obj, f, ensure_ascii=False, indent=2)
+        return path
+
+    return {
+        "tab5_session_summary":
+            _dump(_tab5_session_summary(centroids, stats, run_id), "session_summary.json"),
+        "tab5_capture_quality":
+            _dump(_tab5_capture_quality(centroids, stats),          "capture_quality.json"),
+        "tab5_assistant_cards":
+            _dump({"schema_version": 1, "cards": _tab5_assistant_cards(centroids)},               "assistant_cards.json"),
+        "tab5_blue_team_findings":
+            _dump({"schema_version": 1, "findings": _tab5_blue_team(centroids, stats)},           "blue_team_findings.json"),
+        "tab5_red_team_observations":
+            _dump({"schema_version": 1, "observations": _tab5_red_team(centroids)},               "red_team_observations.json"),
+        "tab5_purple_team_lessons":
+            _dump({"schema_version": 1, "lessons": _tab5_purple_team(centroids)},                 "purple_team_lessons.json"),
+        "tab5_education_cards":
+            _dump({"schema_version": 1, "cards": _tab5_education_cards(centroids)},               "education_cards.json"),
+    }

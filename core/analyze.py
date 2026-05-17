@@ -17,7 +17,7 @@ from .hardware_identity import load_registry_db, summarize_identity
 from .geo import compute_centroid_and_confidence, stability_score, compute_risk
 from .writers import (
     write_csv, write_xlsx, write_kml, write_map_html,
-    write_pcap_reports, write_summary_html,
+    write_pcap_reports, write_summary_html, write_tab5_json_export,
 )
 from .project import create_run_dir, update_manifest, update_project_index
 
@@ -219,6 +219,9 @@ def analyze(
         "high_quality_locations": sum(1 for r in centroids if r.get("LocationQuality") == "High"),
         "medium_quality_locations": sum(1 for r in centroids if r.get("LocationQuality") == "Medium"),
         "overlap_text": f"{overlap} ({overlap_pct}% of PCAP BSSIDs; {overlap_pct_logs}% of log MACs)",
+        "overlap_n": overlap,
+        "overlap_pct": overlap_pct,
+        "overlap_pct_logs": overlap_pct_logs,
         "avg_sightings": round(raw_sightings / log_unique, 2) if log_unique else 0,
         "rssi_range": rssi_range,
         "bounds_str": bounds_str,
@@ -257,6 +260,8 @@ def analyze(
     )
     _emit(status_cb, "[+] R3ND3R1NG: summary.html")
     summary_path = write_summary_html(centroids, run_dir, pcap_status, stats)
+    _emit(status_cb, "[+] WR1T1NG: Tab5 JSON artifacts (7 files)")
+    tab5_arts = write_tab5_json_export(centroids, stats, run_id, run_dir)
 
     results = {
         "project_dir": project_dir,
@@ -267,7 +272,9 @@ def analyze(
         "kml": kml_path,
         "map": map_path,
         "summary": summary_path,
+        "stats": stats,
         **pcap_arts,
+        **tab5_arts,
     }
 
     # 7. Update manifest + project index
@@ -280,6 +287,9 @@ def analyze(
         "pcap_bssid_master.csv", "pcap_bssid_master.xlsx",
         "pcap_station_master.csv", "pcap_station_master.xlsx",
         "pcap_per_file_summary.csv",
+        "session_summary.json", "capture_quality.json", "assistant_cards.json",
+        "blue_team_findings.json", "red_team_observations.json",
+        "purple_team_lessons.json", "education_cards.json",
     ])
 
     return results

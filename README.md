@@ -21,21 +21,55 @@ Wardrive Analyzer is a Windows-first desktop tool for organizing authorized WiFi
 
 ## Quick Start
 
-Create or activate a Python 3.11+ environment, then install the runtime dependencies used by the app.
+Create or activate a Python 3.11+ virtual environment, install all dependencies, then launch:
 
 ```powershell
 cd "F:\Ai\WardriveAPP\Wardrive Analyzer"
 python -m venv .venv
 .\.venv\Scripts\activate
-pip install PySide6 dpkt openpyxl
+pip install -r requirements.txt
 python run_step3d_scene.py
 ```
 
-The local launcher can also be used from Windows:
+The local Windows launcher:
 
 ```powershell
 .\launch.cmd
 ```
+
+### Optional dependencies
+
+| Package | Purpose | Default |
+|---------|---------|---------|
+| `dpkt` | PCAP parsing | Bundled in requirements.txt |
+| `openpyxl` | XLSX report output | Bundled in requirements.txt |
+| `keyring` | Secure API token storage | Bundled in requirements.txt |
+
+If any optional package is missing the feature it provides is silently disabled. The startup validator (`check_deps.py`) will print a warning.
+
+## Running Tests
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest tests/ --timeout=30 -v
+```
+
+Synthetic fixtures are under `tests/fixtures/`. No real evidence is required.
+
+## Scrubbing Evidence Before Sharing
+
+To share a project copy with tokens and optionally GPS coordinates removed:
+
+```powershell
+python wardrive_cli.py scrub-project "F:\WardriveAnalytics" --output-dir "F:\scrubbed_copy"
+python wardrive_cli.py scrub-project "F:\WardriveAnalytics" --fuzz-gps --remove-pcaps
+```
+
+Options:
+- `--output-dir PATH` — destination directory (default: `<project>_scrubbed`)
+- `--fuzz-gps` — adds ±0.001° random offset to all GPS coordinates in CSV evidence
+- `--remove-stations` — strips station-only rows from CSV evidence
+- `--remove-pcaps` — deletes PCAP files from the copy
 
 ## Expected Workflow
 
@@ -82,18 +116,33 @@ See [docs/ai-bridge.md](docs/ai-bridge.md).
 
 ## Verification
 
-Useful checks:
+Syntax check all core files:
 
 ```powershell
 python -m py_compile run_step3d_scene.py gui_step3d_scene.py project_vault.py core\analyze.py core\parser_logs.py core\parser_pcap.py
-git diff --check
 ```
 
-For GUI changes, verify that a visible window titled `Wardrive Mission Control` opens.
+Full pre-release gate:
+
+```powershell
+python scripts/release_check.py
+```
+
+For GUI changes, verify that a visible window titled `Wardrive Mission Control` opens:
 
 ```powershell
 .\.venv\Scripts\pythonw.exe run_step3d_scene.py
 ```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `ModuleNotFoundError: PySide6` | venv not activated or deps not installed | `pip install -r requirements.txt` |
+| PCAP parsing silently skips files | `dpkt` missing | `pip install dpkt` |
+| No XLSX output | `openpyxl` missing | `pip install openpyxl` |
+| Token stored in plaintext | `keyring` missing | `pip install keyring` |
+| App exits immediately | Required dependency check failed | See printed message from `check_deps.py` |
 
 ## Project Structure
 
@@ -120,3 +169,10 @@ Wardrive Analyzer/
 ## Status
 
 This is an active local MVP. Favor working desktop behavior, careful evidence handling, and clear agent handoffs over large architecture rewrites.
+
+## Known Limitations
+
+- No network service. All operations run locally. Remote storage requires manual export.
+- PCAP parsing requires `dpkt`; missing it silently drops all PCAP-derived evidence.
+- GPS fuzzing (`--fuzz-gps`) applies a uniform ±0.001° offset, not differential privacy.
+- `keyring` availability depends on OS credential store; on minimal server installs tokens fall back to plaintext SQLite storage.
