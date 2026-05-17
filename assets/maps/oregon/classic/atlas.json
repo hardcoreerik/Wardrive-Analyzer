@@ -1,0 +1,21 @@
+{
+  "lat_min": 41.8,
+  "lat_max": 46.4,
+  "lon_min": -124.8,
+  "lon_max": -116.3,
+  "width": 1024,
+  "height": 768,
+  "labels": [
+    {
+      "name": "Eugene",
+      "lat": 44.0521,
+      "lon": -123.0868
+    },
+    {
+      "name": "Springfield",
+      "lat": 44.0462,
+      "lon": -123.022
+    }
+  ],
+  "regions": []
+}

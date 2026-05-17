@@ -18,6 +18,20 @@ PATH_KEY_PARTS = ("path", "dir", "file", "output", "pcap")
 SECRET_KEY_PARTS = ("token", "key", "secret", "credential", "password")
 
 
+def redact_token(token: str) -> str:
+    """Return a safe display string for a token — never the token value.
+
+    Always call this before logging or displaying any API key or credential.
+    Returns a string of the form ``sk-...xxxx`` (last-4 hint) or ``[empty]``.
+    """
+    if not token or not token.strip():
+        return "[empty]"
+    stripped = token.strip()
+    if len(stripped) <= 8:
+        return "[redacted]"
+    return f"{stripped[:3]}...{stripped[-4:]}"
+
+
 @dataclass
 class BuddyAIConfig:
     enabled: bool = False
@@ -182,10 +196,12 @@ class BuddyAIClient:
             with urllib.request.urlopen(request, timeout=30) as response:
                 body = json.loads(response.read().decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
+            # Read detail but sanitize before surfacing — never echo back auth headers
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             raise BuddyAIError(f"AI provider rejected the request: HTTP {exc.code} {detail}") from exc
         except Exception as exc:
-            raise BuddyAIError(f"AI provider request failed: {exc}") from exc
+            # Stringify without repr to avoid echoing request object (which may hold headers)
+            raise BuddyAIError(f"AI provider request failed: {type(exc).__name__}: {exc}") from exc
 
         try:
             text = body["choices"][0]["message"]["content"]

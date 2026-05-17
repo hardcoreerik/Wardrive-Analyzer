@@ -189,5 +189,117 @@ def analyze_project(
     )
 
 
+def scrub_project(
+    project_dir: str,
+    output_dir: Optional[str] = None,
+    fuzz_gps: bool = False,
+    remove_stations: bool = False,
+    remove_pcaps: bool = False,
+) -> dict[str, Any]:
+    """
+    Copy a project vault into output_dir with tokens redacted.
+
+    Removes tokens from the settings table in the DB copy.
+    Optionally fuzz GPS coordinates in CSV evidence files (+/- 0.001 deg),
+    strip station rows, or remove PCAP files from the copy.
+    """
+    import random
+    import shutil
+    import sqlite3
+    import csv
+    import io
+
+    src = Path(os.path.abspath(project_dir))
+    if not src.is_dir():
+        return result("error", error=f"Project directory not found: {src}")
+
+    dest_name = output_dir or (str(src) + "_scrubbed")
+    dest = Path(dest_name)
+    if dest.exists():
+        return result("error", error=f"Output directory already exists: {dest}")
+
+    shutil.copytree(str(src), str(dest))
+
+    # Redact tokens in all .db files
+    token_keys = ("token", "key", "secret", "credential", "password", "api")
+    redacted_keys: list[str] = []
+    for db_file in dest.rglob("*.db"):
+        try:
+            con = sqlite3.connect(str(db_file))
+            cur = con.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            if "settings" in tables:
+                cur.execute("SELECT key, value FROM settings")
+                rows = cur.fetchall()
+                for k, v in rows:
+                    if any(t in k.lower() for t in token_keys) and v:
+                        cur.execute("UPDATE settings SET value=? WHERE key=?", ("[redacted]", k))
+                        redacted_keys.append(k)
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    # Process CSV evidence files
+    removed_pcaps: list[str] = []
+    fuzzed_csvs: list[str] = []
+
+    COORD_FIELDS = {"currentlatitude", "currentlongitude", "lat", "lon", "latitude", "longitude"}
+
+    for csv_file in dest.rglob("*.csv"):
+        try:
+            text = csv_file.read_text(encoding="utf-8", errors="replace")
+            reader = csv.DictReader(io.StringIO(text))
+            if reader.fieldnames is None:
+                continue
+
+            changed = False
+            output_rows: list[dict] = []
+            for row in reader:
+                if remove_stations:
+                    # Skip rows with no BSSID (station-only rows)
+                    bssid = row.get("MAC", row.get("BSSID", ""))
+                    # Stations typically have no SSID
+                    ssid = row.get("SSID", row.get("ssid", ""))
+                    if not ssid and bssid:
+                        changed = True
+                        continue
+                if fuzz_gps:
+                    for field in list(row.keys()):
+                        if field.lower() in COORD_FIELDS:
+                            try:
+                                val = float(row[field])
+                                row[field] = str(round(val + random.uniform(-0.001, 0.001), 6))
+                                changed = True
+                            except (ValueError, TypeError):
+                                pass
+                output_rows.append(row)
+
+            if changed:
+                buf = io.StringIO()
+                writer = csv.DictWriter(buf, fieldnames=reader.fieldnames)
+                writer.writeheader()
+                writer.writerows(output_rows)
+                csv_file.write_text(buf.getvalue(), encoding="utf-8")
+                fuzzed_csvs.append(str(csv_file.relative_to(dest)))
+        except Exception:
+            pass
+
+    if remove_pcaps:
+        for pcap_file in list(dest.rglob("*.pcap")):
+            removed_pcaps.append(str(pcap_file.relative_to(dest)))
+            pcap_file.unlink()
+
+    return result(
+        "ok",
+        source=str(src),
+        output=str(dest),
+        redacted_settings_keys=redacted_keys,
+        fuzzed_csvs=fuzzed_csvs,
+        removed_pcaps=removed_pcaps,
+    )
+
+
 def dumps_json(data: dict[str, Any], pretty: bool = True) -> str:
     return json.dumps(_jsonable(data), indent=2 if pretty else None, sort_keys=False)

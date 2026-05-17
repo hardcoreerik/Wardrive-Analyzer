@@ -20,7 +20,14 @@ def _zip_project(project_dir: str) -> str:
     ts = time.strftime("%Y%m%d-%H%M%S")
     base_name = f"wardrive_project_{ts}.zip"
     out_path = os.path.join(tempfile.gettempdir(), base_name)
-    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    # Some SD-card captures come in with pre-1980 timestamps (no RTC).
+    # strict_timestamps=False clamps invalid DOS dates instead of raising.
+    with zipfile.ZipFile(
+        out_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        strict_timestamps=False,
+    ) as zf:
         for root, dirs, files in os.walk(project_dir):
             dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
             for file_name in files:

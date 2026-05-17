@@ -1,0 +1,17 @@
+# Wardrive Analyzer — runtime dependencies
+# Install: pip install -r requirements.txt
+#
+# Core GUI framework
+PySide6>=6.6.0
+
+# PCAP parsing (optional at import time; app degrades gracefully if absent)
+dpkt>=1.9.8
+
+# XLSX report generation (optional at import time)
+openpyxl>=3.1.0
+
+# Secure credential storage (optional; app falls back to keyring-absent path)
+keyring>=24.0.0
+
+# ---- dev/test dependencies ----
+# Install separately: pip install -r requirements-dev.txt

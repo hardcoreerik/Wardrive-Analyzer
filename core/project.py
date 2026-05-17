@@ -62,7 +62,11 @@ def update_manifest(project_dir: str, run_id: str, artifacts: dict) -> None:
     entry = {
         "run_id": run_id,
         "created": now_str(),
-        "artifacts": {k: os.path.basename(v) if v and v != NO_DATA else v for k, v in artifacts.items()},
+        "artifacts": {
+            k: os.path.basename(v) if v and v != NO_DATA else v
+            for k, v in artifacts.items()
+            if isinstance(v, str)
+        },
     }
     data["runs"].append(entry)
     try:

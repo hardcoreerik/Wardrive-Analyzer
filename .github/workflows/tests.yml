@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+    branches: [master, "codex/**", "claude/**"]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Syntax check
+        run: |
+          python -m py_compile run_step3d_scene.py
+          python -m py_compile gui_step3d_scene.py
+          python -m py_compile project_vault.py
+          python -m py_compile wardrive_cli.py
+          python -m py_compile wardrive_service.py
+          python -m py_compile buddy_ai.py
+          python -m py_compile error_logger.py
+          python -m py_compile check_deps.py
+          python -m py_compile core/__init__.py
+          python -m py_compile core/analyze.py
+          python -m py_compile core/constants.py
+          python -m py_compile core/geo.py
+          python -m py_compile core/helpers.py
+          python -m py_compile core/parser_logs.py
+          python -m py_compile core/parser_pcap.py
+          python -m py_compile core/project.py
+          python -m py_compile core/writers.py
+
+      - name: Run tests
+        run: python -m pytest tests/ --timeout=30 -v

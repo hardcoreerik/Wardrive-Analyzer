@@ -1,0 +1,4 @@
+WigleWifi-1.4 (header line — ignored by parser)
+MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
+AA:BB:CC:DD:EE:10,WiGLEExport1,[WPA2-PSK-CCMP][ESS],2024-02-01 09:00:00,6,-70,47.700000,-122.400000,60.0,6.0,WIFI
+AA:BB:CC:DD:EE:11,WiGLEExport2,[ESS],2024-02-01 09:01:00,11,-75,47.701000,-122.401000,60.0,9.0,WIFI
