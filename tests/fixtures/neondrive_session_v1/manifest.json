@@ -1,0 +1,34 @@
+{
+  "schema": "neondrive.session.v1",
+  "session_id": "ND-CYD35-0001-SP3CTER-T0000300",
+  "device": {
+    "device_id": "ND-CYD35-A91B58",
+    "hardware": "NEONDRIVE // CYD-3.5",
+    "profile_code": "cyd_3_5"
+  },
+  "profile": {
+    "module": "SP3CTER",
+    "mode": "controlled_lab_validation"
+  },
+  "target": {
+    "ssid": "LabTestSSID",
+    "bssid": "AA:BB:CC:DD:EE:FF",
+    "channel": 6,
+    "security": "WPA2"
+  },
+  "timing": {
+    "millis_since_boot": 300000
+  },
+  "artifacts": [
+    {"type": "events_csv",   "path": "events.csv",                  "required": true},
+    {"type": "hash_export",  "path": "artifacts/specter.hc22000",   "format": "hc22000", "required": false},
+    {"type": "stats_csv",    "path": "artifacts/stats.csv",         "required": false}
+  ],
+  "quick_result": {
+    "status": "WARNING",
+    "findings": [
+      {"finding": "PMKID candidates observed", "count": 2},
+      {"finding": "EAPOL frames captured", "count": 3}
+    ]
+  }
+}

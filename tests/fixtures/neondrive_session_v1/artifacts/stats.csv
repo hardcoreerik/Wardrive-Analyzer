@@ -1,0 +1,5 @@
+elapsed_ms,packets,clients,handshakes,pmkids
+0,0,0,0,0
+5000,142,2,1,0
+10000,289,2,2,1
+15000,401,3,3,2

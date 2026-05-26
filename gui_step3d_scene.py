@@ -2855,6 +2855,16 @@ class WardriveGUI(QWidget):
         rowi.addWidget(self.btn_sd_ingest)
         v.addLayout(rowi)
 
+        rownd = QHBoxLayout()
+        self.btn_import_neondrive = QPushButton("Import NEONDRIVE Session…")
+        self.btn_import_neondrive.setToolTip(
+            "Select a Dropbox-synced NEONDRIVE session folder to import its evidence bundle.\n"
+            "The folder must contain a completed sync_complete.flag and manifest.json."
+        )
+        self.btn_import_neondrive.clicked.connect(self.import_neondrive_session)
+        rownd.addWidget(self.btn_import_neondrive)
+        v.addLayout(rownd)
+
         rowa0 = QHBoxLayout()
         self.btn_sd_analyze_now = QPushButton("Analyze Selected Now (from SD)")
         self.btn_sd_analyze_now.setObjectName("PrimaryButton")
@@ -5079,6 +5089,71 @@ class WardriveGUI(QWidget):
         lw = self._current_sd_list()
         for i in range(lw.count()):
             lw.item(i).setCheckState(Qt.Unchecked)
+
+    def import_neondrive_session(self):
+        """Import a single NEONDRIVE session bundle from a Dropbox-synced folder."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from neondrive_import import import_neondrive_session, validate_neondrive_session
+
+        if not self.project_dir:
+            QMessageBox.warning(self, "Missing Project", "Select a Project Folder first.")
+            return
+
+        session_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select NEONDRIVE Session Folder",
+            "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
+        )
+        if not session_dir:
+            return
+
+        # Validate before importing
+        ok, reason = validate_neondrive_session(session_dir)
+        if not ok:
+            QMessageBox.critical(
+                self,
+                "Invalid Session Bundle",
+                f"Cannot import this folder:\n\n{reason}\n\n"
+                "Make sure the NEONDRIVE device has completed the Dropbox sync "
+                "(sync_complete.flag must be present).",
+            )
+            return
+
+        messages: list[str] = []
+
+        def log_cb(msg: str) -> None:
+            messages.append(msg)
+
+        try:
+            result = import_neondrive_session(
+                project_dir=self.project_dir,
+                session_dir=session_dir,
+                progress_cb=log_cb,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Unexpected error during import:\n{e}")
+            return
+
+        detail = "\n".join(messages[-20:]) if messages else ""
+        if result.ok and result.status == "imported":
+            QMessageBox.information(
+                self,
+                "NEONDRIVE Import Complete",
+                f"{result.message}\n\n{detail}",
+            )
+        elif result.ok and result.status == "already_imported":
+            QMessageBox.information(
+                self,
+                "Already Imported",
+                f"Session {result.session_id} was already imported.\n\n{detail}",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Import Issue",
+                f"Status: {result.status}\n\n{result.message}\n\n{detail}",
+            )
 
     def sd_ingest_selected(self):
         if not self.project_dir:

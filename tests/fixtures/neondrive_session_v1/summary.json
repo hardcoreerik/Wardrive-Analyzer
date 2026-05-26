@@ -1,0 +1,22 @@
+{
+  "schema": "neondrive.summary.v1",
+  "session_id": "ND-CYD35-0001-SP3CTER-T0000300",
+  "device_id": "ND-CYD35-A91B58",
+  "module": "SP3CTER",
+  "status": "WARNING",
+  "evidence": {
+    "pmkid_count": 2,
+    "handshake_frames": 3,
+    "has_pcap": false,
+    "has_hash_export": true
+  },
+  "target": {
+    "ssid": "LabTestSSID",
+    "bssid": "AA:BB:CC:DD:EE:FF",
+    "channel": 6
+  },
+  "sync": {
+    "dropbox_status": "synced",
+    "analyzer_status": "not_seen"
+  }
+}

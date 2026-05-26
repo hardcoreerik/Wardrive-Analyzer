@@ -13,7 +13,7 @@ from typing import Dict, List, Literal, Tuple
 APP_ID = "WardriveAlpha"
 DB_NAME = "project.db"
 
-SourceApp = Literal["marauder", "porkchop", "bruce", "nemo", "unknown"]
+SourceApp = Literal["marauder", "porkchop", "bruce", "nemo", "neondrive", "unknown"]
 
 
 @dataclass
@@ -87,6 +87,19 @@ _JAMMIT_TARGET_DIR_RE = re.compile(
     r"(?:^|/)captures/[^/]+_[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}(?:/|$)",
     re.IGNORECASE,
 )
+
+# NEONDRIVE session bundle: /neondrive/sessions/ND-<board>-<seq>-<module>-T<ms>/
+_NEONDRIVE_SESSION_DIR_RE = re.compile(
+    r"(?:^|/)neondrive/(?:incoming/[^/]+/)?sessions/ND-[^/]+/",
+    re.IGNORECASE,
+)
+
+# Known NEONDRIVE bundle files and their classifications
+_NEONDRIVE_MANIFEST_NAMES = {"manifest.json", "summary.json", "sync_complete.flag"}
+_NEONDRIVE_EVENTS_NAMES   = {"events.csv"}
+_NEONDRIVE_ARTIFACT_PCAP  = {"handshakes.pcap", "raw.pcap", "beacon.pcap"}
+_NEONDRIVE_ARTIFACT_HASH  = {"specter.hc22000", "specter.hc"}
+_NEONDRIVE_ARTIFACT_META  = {"stats.csv", "capture_summary.txt", "jammit_session.log"}
 
 # Kinds that are NOT wardrive/GPS data — exclude from log analysis input
 _NON_WARDRIVE_LOG_KINDS = {
@@ -461,6 +474,25 @@ def classify_candidate(rel_path: str, filename: str) -> Tuple[SourceApp, str, bo
     fn = filename.lower()
     rel_lower = rel_path.lower().replace("\\", "/")
     ext = os.path.splitext(fn)[1].lower()
+
+    # ----------------------------------------------------------------
+    # NEONDRIVE session bundle — check before generic rules
+    # Matches: /neondrive/sessions/ND-<id>/ or Dropbox incoming paths
+    # ----------------------------------------------------------------
+    if _NEONDRIVE_SESSION_DIR_RE.search(rel_lower):
+        if filename in _NEONDRIVE_MANIFEST_NAMES:
+            return "neondrive", "neondrive_meta", False, "NEONDRIVE session metadata"
+        if filename in _NEONDRIVE_EVENTS_NAMES:
+            return "neondrive", "neondrive_events", True, "NEONDRIVE event timeline"
+        if fn in _NEONDRIVE_ARTIFACT_PCAP:
+            return "neondrive", "pcap_neondrive", True, "NEONDRIVE capture PCAP"
+        if fn in _NEONDRIVE_ARTIFACT_HASH or ext == ".22000":
+            return "neondrive", "handshake_22000", True, "NEONDRIVE hashcat export"
+        if fn in _NEONDRIVE_ARTIFACT_META:
+            return "neondrive", "neondrive_session_log", False, "NEONDRIVE session log"
+        if ext in (".pcap", ".pcapng"):
+            return "neondrive", "pcap_neondrive", True, "NEONDRIVE capture PCAP"
+        return "neondrive", "neondrive_other", False, "NEONDRIVE session file"
 
     # ----------------------------------------------------------------
     # Nemo (M5Stick Nemo)

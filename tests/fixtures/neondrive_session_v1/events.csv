@@ -1,0 +1,5 @@
+timestamp_ms,event_type,module,severity,target_ssid,target_bssid,channel,message,artifact_path
+0,session_start,SP3CTER,info,LabTestSSID,AA:BB:CC:DD:EE:FF,6,Session bundle staged,
+45000,pmkid_captured,SP3CTER,warning,LabTestSSID,AA:BB:CC:DD:EE:FF,6,2 PMKID candidate(s) observed,artifacts/specter.hc22000
+87000,eapol_frames,SP3CTER,info,LabTestSSID,AA:BB:CC:DD:EE:FF,6,3 EAPOL frame(s) captured,
+300000,session_end,SP3CTER,info,LabTestSSID,AA:BB:CC:DD:EE:FF,6,Bundle ready for Wardrive Analyzer sync,
