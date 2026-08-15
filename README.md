@@ -1,6 +1,12 @@
-# Wardrive Analyzer
+# OrcAlyzer
 
-Windows-first desktop analysis platform for authorized wardrive evidence. It ingests Wi-Fi logs and PCAPs, normalizes observations into a local project vault, and produces analyst-ready exports and visual reports.
+(Formerly Wardrive Analyzer.) Wardrive evidence analysis across desktop, Android, and the M5Stack Tab5 field device, unified into one repo. It ingests Wi-Fi logs and PCAPs, normalizes observations into a local project vault, and produces analyst-ready exports and visual reports.
+
+## Repo Layout
+
+- **Desktop** (this directory) — the primary PySide6 analysis app; see Main Components below.
+- **`android-app/`** — Android-native evidence analyzer (local parsing, map workflows, sync).
+- **`tab5-firmware/`** — M5Stack Tab5 (ESP32-P4) field firmware: WiFi scanning, and a Companion Link client that talks to the desktop app. ESP-IDF only — see `tab5-firmware/project_truth.md` before touching its build setup.
 
 ## Core Value
 

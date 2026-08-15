@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
     <application
         android:name=".WardriveApplication"
         android:allowBackup="true"
@@ -8,6 +11,15 @@
         android:roundIcon="@android:drawable/ic_menu_compass"
         android:supportsRtl="true"
         android:theme="@style/Theme.WardriveAnalyzer">
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.wardrive.analyzer.android.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
         <activity
             android:name=".MainActivity"
             android:exported="true">

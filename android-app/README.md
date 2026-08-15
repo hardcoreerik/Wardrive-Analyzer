@@ -1,52 +1,51 @@
 # Wardrive Analyzer Android
 
-Android-native buildout of Wardrive Analyzer Mission Control.
+Android-native field companion for authorized wardrive evidence workflows. The app ingests synced archives, parses wireless evidence, stores results locally, and renders map/report views optimized for on-device analysis.
 
-## Current status (v0.1.0)
+## Core Capabilities
 
-Implemented:
-- Kotlin + Jetpack Compose app shell
-- Mission Control tabs: Dashboard, Evidence, Runs, Reports, Import
-- Local CSV/log import pipeline with Room persistence
-- Run + summary report generation on import
+- Kotlin + Jetpack Compose application shell
+- Evidence ingestion for CSV/log/PCAP-oriented project bundles
+- Local persistence with Room
+- Interactive map and report surfaces
+- Dropbox project sync support from in-app settings
 
-Planned next:
-- PCAP metadata ingest parity
-- Rich report export parity (CSV/XLSX/KML/HTML)
-- Map visualization parity
+## Screens
 
-## Install APK
+- `Home` - project status and sync health
+- `Live` - streaming and latest observations
+- `Map` - map-first evidence exploration
+- `Files` - project artifacts and imports
+- `Settings` - Dropbox and runtime configuration
 
-Prebuilt APKs are published in GitHub Releases.
-
-- `app-release.apk`: installable release build
-- `app-debug.apk`: debug build for testing
-
-On Android device:
-1. Download APK from Releases.
-2. Allow install from unknown sources for your browser/file manager.
-3. Open the APK and install.
-
-## Build locally
+## Build
 
 ```powershell
-cd "android-app"
 .\gradlew.bat assembleDebug
 .\gradlew.bat assembleRelease
 ```
 
 Artifacts:
+
 - `app/build/outputs/apk/debug/app-debug.apk`
 - `app/build/outputs/apk/release/app-release.apk`
 
-## Function parity map
+## Install
 
-Desktop source -> Android target
+Use release assets from GitHub Releases or install locally with ADB:
 
-- `core/parser_logs.py` -> `ingest/WardriveLogParser.kt` (baseline complete)
-- `project_vault.py` evidence inventory -> Room entities/DAOs (baseline complete)
-- `core/project.py` run manifests -> `RunEntity` and `ReportEntity` (baseline complete)
-- `core/parser_pcap.py` -> planned `ingest/PcapIngestService.kt` (pending)
-- `core/writers.py` -> planned `export/ReportWriterService.kt` (pending)
-- `wardrive_service.py` summaries -> planned `repo/AnalyticsRepository.kt` (pending)
-- `assistant_engine.py` / `buddy_ai.py` -> planned `assistant/` module (pending)
+```powershell
+adb install -r app\build\outputs\apk\debug\app-debug.apk
+```
+
+## Development Standards
+
+- CI validates build/test on pull requests
+- Changes should include validation notes in PRs
+- Security-sensitive values must remain out of source
+
+## Project Docs
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [SECURITY.md](SECURITY.md)
+- [CHANGELOG.md](CHANGELOG.md)

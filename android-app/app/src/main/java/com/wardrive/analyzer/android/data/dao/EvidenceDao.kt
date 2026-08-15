@@ -23,4 +23,7 @@ interface EvidenceDao {
 
     @Query("DELETE FROM evidence")
     suspend fun clear()
+
+    @Query("DELETE FROM evidence WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<Long>)
 }

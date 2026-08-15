@@ -1,0 +1,13 @@
+# Name,     Type, SubType,  Offset,  Size, Flags
+# Tab5 has 16MB flash. WiFi (esp_hosted/mbedtls/lwip) pushed the single 1MB
+# factory image over budget, so this moves to OTA-capable dual app slots
+# sized with real headroom for camera/audio/companion-sync features still
+# to come, plus a SPIFFS partition for on-device capture storage.
+# NOTE: no esp_ota_mark_app_valid_cancel_rollback() call exists yet -- add
+# one before wiring an actual OTA update flow.
+nvs,        data, nvs,      ,        0x6000,
+otadata,    data, ota,      ,        0x2000,
+phy_init,   data, phy,      ,        0x1000,
+ota_0,      app,  ota_0,    ,        3M,
+ota_1,      app,  ota_1,    ,        3M,
+storage,    data, spiffs,   ,        2M,

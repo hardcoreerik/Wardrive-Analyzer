@@ -1,0 +1,26 @@
+idf_component_register(
+    SRCS
+        "main.cpp"
+        "display.cpp"
+        "touch.cpp"
+        "ui.cpp"
+        "utils.cpp"
+        "wifi.cpp"
+        "oui.cpp"
+        "companion.cpp"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        m5stack_tab5
+        m5gfx
+        esp_timer
+        esp_system
+        esp_hw_support
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        esp_http_client
+        mdns
+        json
+)

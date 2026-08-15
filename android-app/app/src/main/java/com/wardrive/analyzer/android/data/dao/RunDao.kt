@@ -14,4 +14,7 @@ interface RunDao {
 
     @Query("SELECT * FROM runs ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<RunEntity>>
+
+    @Query("DELETE FROM runs WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<Long>)
 }

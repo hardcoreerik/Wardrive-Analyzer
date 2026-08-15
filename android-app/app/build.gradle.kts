@@ -64,6 +64,7 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.navigation:navigation-compose:2.7.7")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("com.github.mik3y:usb-serial-for-android:3.9.0")
 
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")

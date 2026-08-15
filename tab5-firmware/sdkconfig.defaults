@@ -1,0 +1,79 @@
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+# CONFIG_ESP32P4_REV_MIN_301 is not set
+
+# WiFi via ESP32-C6 coprocessor (esp_wifi_remote + esp_hosted over SDIO).
+# esp_hosted MUST be exactly 2.12.6 (see main/idf_component.yml and
+# project_truth.md) -- matches the C6 coprocessor's flashed firmware,
+# which can only be updated via M5Burner's official firmware or a
+# JTAG/serial connection, not something this project touches. As of
+# 2.12.6, Espressif's Tab5 board preset (ESP32P4_TAB5_C6_BOARD auto-pin-
+# mapping) does not exist yet -- it landed in a later 2.12.x patch. So
+# every pin is set manually here, using the same values that preset
+# would have supplied (cross-checked against a newer esp_hosted's preset
+# defaults, and matching what NEONDRIVE independently hand-derived by
+# reverse-engineering the board). Do not swap in the board-preset symbol
+# names (ESP32P4_TAB5_C6_BOARD, etc) unless the pinned version is bumped
+# past whichever patch adds Tab5 awareness -- verify against
+# managed_components/espressif__esp_hosted/Kconfig directly, since this
+# component's Kconfig surface has changed meaningfully between patches.
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+# Tab5's C6 reset circuit is active-low; the Kconfig default here is
+# active-high, which leaves the C6 permanently in reset and SDIO
+# enumeration times out (sdmmc send_op_cond 0x107) -- the exact failure
+# NEONDRIVE hit and documented in their own handoff notes.
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_LOW=y
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=13
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=12
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=11
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=10
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=9
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=8
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
+
+# From OrcSDR's proven sdkconfig.defaults (same C6 fw, same idf-hosted
+# migration -- github.com/hardcoreerik/OrcSDR commit 75d607fa). Likely
+# the actual fix for "assert failed: esp_startup_start_app" (main task
+# creation failing very early in boot): DFLT_TASK_FROM_SPIRAM moves
+# esp_hosted's own task stacks out of the small internal-RAM pool that
+# assert draws from, and MEMPOOL + smaller TX/RX queues reduce internal
+# footprint further. FREERTOS_HZ=1000 is esp_hosted's own recommendation
+# (it otherwise warns "CONFIG_FREERTOS_HZ is 100, ESP-Hosted recommended
+# 1000, to avoid bus level jitters" at every boot).
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=4
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=2
+CONFIG_ESP_HOSTED_USE_MEMPOOL=y
+CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM=y
+
+# GT911 touch I2C read intermittently fails while the C6 hosted SDIO link
+# is active (auto-inits before app_main, stays busy in the background).
+# BSP_ERROR_CHECK's default hard-abort-on-failure turns that transient
+# into a boot-reset loop; disable it so display::begin() can retry instead.
+CONFIG_BSP_ERROR_CHECK=n
+
+# 16MB flash, WiFi stack needs more than the 1MB single-app default.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Tab5's display is 5" at 1280x720 (~294 PPI) -- high DPI for its size.
+# LVGL's default Montserrat 14 font (and the button/panel sizes tuned
+# against it) is illegible on real hardware at that density. Compile in
+# larger built-in fonts and make Montserrat 24 the default body size;
+# ui.cpp uses Montserrat 32 explicitly for headers/titles.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_24=y

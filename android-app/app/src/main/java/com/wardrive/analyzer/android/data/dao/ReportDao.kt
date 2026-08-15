@@ -14,4 +14,7 @@ interface ReportDao {
 
     @Query("SELECT * FROM reports ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<ReportEntity>>
+
+    @Query("DELETE FROM reports WHERE runId IN (:runIds)")
+    suspend fun deleteByRunIds(runIds: List<Long>)
 }

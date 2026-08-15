@@ -1,0 +1,26 @@
+dependencies:
+  espressif/esp_wifi_remote:
+    version: "*"
+  espressif/esp_hosted:
+    # MUST be exactly 2.12.6 -- matches this board's C6 coprocessor
+    # firmware, fixed in flash. Not "^2.12.6" (resolves to latest 2.x,
+    # e.g. 2.12.12) and not "*" (resolves to 3.0.6) -- see project_truth.md.
+    # NOTE: 2.12.12 (via ^2.12.6) reproducibly crashed boot with
+    # "assert failed: esp_startup_start_app app_startup.c:86" before
+    # app_main ran; exact-pinning to 2.12.6 itself has NOT been tried yet
+    # (previous attempts pulled 2.12.12, never the literal 2.12.6 release).
+    # Re-verify this is actually a resolvable version on the registry.
+    version: "2.12.6"
+  espressif/mdns:
+    version: "*"
+  m5gfx:
+    # No Espressif-registry namespace -- pulled straight from GitHub.
+    # Raw esp-bsp (esp_lcd_ili9881c) has no ST7123 TDDI display driver at
+    # all, only the touch side got fixed (task #8). M5GFX ships a real
+    # Panel_ST7123 + Touch_ST7123 pair with Tab5 auto-detection that
+    # probes the same I2C address (0x55) our own probe found -- this is
+    # the actual fix for "no image on screen".
+    git: https://github.com/m5stack/M5GFX.git
+    version: "0.2.26"
+  idf:
+    version: ">=5.4"

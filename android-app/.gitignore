@@ -13,6 +13,17 @@ local.properties
 # Logs
 *.log
 
+# Local data / evidence artifacts
+*.db
+*.sqlite
+*.sqlite3
+latest_project.zip
+dropbox_sync/
+
+# Ad-hoc local media
+docs/screenshots/download.*
+_tmp*
+
 # OS
 .DS_Store
 Thumbs.db
